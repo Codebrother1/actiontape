@@ -1132,7 +1132,7 @@ interface AuditActionResult {
   target: string;
   mappingSource: "declared" | "default_confirmed" | "unknown";
   envelope: "evaluation" | "evaluations" | null;
-  status: "permit" | "deny" | "unknown" | "mapping_error" | "not_evaluated";
+  status: "permit" | "deny" | "unknown" | "mapping_error" | "pdp_error" | "not_evaluated";
   reason: string | null;
   decisionCount: number;
   pdpRequestCount: number;
@@ -1148,6 +1148,7 @@ interface AuditResult {
   denyCount: number;
   unknownCount: number;
   mappingErrorCount: number;
+  pdpErrorCount: number;
   notEvaluatedCount: number;
   decisionCount: number;
   pdpRequestCount: number;
@@ -1251,6 +1252,7 @@ async function runAuthzenAudit(
     denyCount: 0,
     unknownCount: 0,
     mappingErrorCount: 0,
+    pdpErrorCount: 0,
     notEvaluatedCount: 0,
     decisionCount: 0,
     pdpRequestCount: 0,
@@ -1392,19 +1394,22 @@ async function runAuthzenAudit(
         decisions,
       });
     } catch (err) {
-      // PDP/transport failures are fatal: stop issuing requests and mark the
-      // remaining renderable actions not_evaluated rather than implying a
-      // decision was reached. Requests already sent still count.
+      // PDP/transport failures are fatal: stop issuing requests. The action
+      // whose own request failed is pdp_error — it was attempted but yielded
+      // no trustworthy complete decision set — while later renderable actions
+      // are not_evaluated (zero requests sent). Requests already sent and
+      // decisions already received still count.
       pdpFailed = true;
+      const message = err instanceof Error ? err.message : String(err);
       result.actions.push({
         ...base,
-        status: "not_evaluated",
-        reason: null,
+        status: "pdp_error",
+        reason: message,
         decisionCount: decisions.length,
         pdpRequestCount: requests,
         decisions,
       });
-      result.error = err instanceof Error ? err.message : String(err);
+      result.error = message;
     }
   }
 
@@ -1412,6 +1417,7 @@ async function runAuthzenAudit(
   result.denyCount = result.actions.filter((a) => a.status === "deny").length;
   result.unknownCount = result.actions.filter((a) => a.status === "unknown").length;
   result.mappingErrorCount = result.actions.filter((a) => a.status === "mapping_error").length;
+  result.pdpErrorCount = result.actions.filter((a) => a.status === "pdp_error").length;
   result.notEvaluatedCount = result.actions.filter((a) => a.status === "not_evaluated").length;
   result.decisionCount = result.actions.reduce((n, a) => n + a.decisionCount, 0);
   result.pdpRequestCount = result.actions.reduce((n, a) => n + a.pdpRequestCount, 0);
@@ -1435,6 +1441,7 @@ async function runAuthzenAudit(
   log(`deny: ${result.denyCount}`);
   log(`unknown: ${result.unknownCount}`);
   log(`mapping-errors: ${result.mappingErrorCount}`);
+  log(`pdp-errors: ${result.pdpErrorCount}`);
   log(`decisions: ${result.decisionCount}`);
   log(`pdp-requests: ${result.pdpRequestCount}`);
   log("");
@@ -1455,6 +1462,9 @@ async function runAuthzenAudit(
       detail = UNKNOWN_REASON_LABELS[a.reason as McpMappingUnknownReason] ?? String(a.reason);
     } else if (a.status === "mapping_error") {
       label = "ERROR   ";
+      detail = String(a.reason);
+    } else if (a.status === "pdp_error") {
+      label = "PDP ERR ";
       detail = String(a.reason);
     } else {
       label = "SKIPPED ";

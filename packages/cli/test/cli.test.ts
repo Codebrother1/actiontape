@@ -1816,7 +1816,7 @@ describe("actiontape authzen", () => {
       expect(pdp.captured).toHaveLength(3);
     });
 
-    it("fatal PDP error stops later requests and marks them not_evaluated", async () => {
+    it("single-evaluation PDP failure is pdp_error; later actions not_evaluated", async () => {
       const dir = await mkdtemp(join(tmpdir(), "actiontape-audit-"));
       const tape = await writeDirTape(dir, [
         ["client_to_server", req(1, "tools/list")],
@@ -1839,13 +1839,96 @@ describe("actiontape authzen", () => {
       expect(j.parsed.status).toBe("error");
       expect(j.parsed.actions.map((a) => a.status)).toEqual([
         "permit",
-        "not_evaluated",
+        "pdp_error",
         "not_evaluated",
       ]);
+      const failed = j.parsed.actions[1]!;
+      expect(failed.pdpRequestCount).toBe(1);
+      expect(failed.decisionCount).toBe(0);
+      expect(failed.decisions).toEqual([]);
+      expect(failed.reason).toBeTruthy();
+      const skipped = j.parsed.actions[2]!;
+      expect(skipped.pdpRequestCount).toBe(0);
+      expect(skipped.decisionCount).toBe(0);
+      expect(skipped.decisions).toEqual([]);
+      expect(j.parsed.pdpErrorCount).toBe(1);
+      expect(j.parsed.notEvaluatedCount).toBe(1);
       expect(j.parsed.pdpRequestCount).toBe(2);
       expect(j.parsed.decisionCount).toBe(1);
       expect(pdp.captured).toHaveLength(2);
       expect(j.errors.join("\n")).not.toMatch(/\n\s+at /);
+    });
+
+    it("native batch response failure is pdp_error with one request sent", async () => {
+      const dir = await mkdtemp(join(tmpdir(), "actiontape-audit-"));
+      const tape = await writeDirTape(dir, [
+        ["client_to_server", req(1, "tools/list")],
+        ["server_to_client", res(1, catalog(tool("copy", COPY_MAPPING)))],
+        ["client_to_server", call(2, "copy", { source: "/a", dest: "/b" })],
+        ["server_to_client", res(2, {})],
+      ]);
+      const claims = await writeClaims(dir, CLAIMS);
+      const pdp = await startPdp((_b, res) => {
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ evaluations: [{ decision: true }] }));
+      });
+      const j = await runAuditJson(tape, claims, [
+        "--evaluation-endpoint",
+        pdp.evalUrl,
+        "--evaluations-endpoint",
+        pdp.batchUrl,
+      ]);
+      expect(j.code).toBe(2);
+      expect(j.parsed.status).toBe("error");
+      const a = j.parsed.actions[0]!;
+      expect(a.status).toBe("pdp_error");
+      expect(a.pdpRequestCount).toBe(1);
+      expect(a.decisionCount).toBe(0);
+      expect(j.parsed.pdpErrorCount).toBe(1);
+      expect(pdp.captured).toHaveLength(1);
+    });
+
+    it("fallback partial failure preserves decisions and stops the audit", async () => {
+      const dir = await mkdtemp(join(tmpdir(), "actiontape-audit-"));
+      const triMapping = {
+        evaluations: {
+          subject: { type: "identity", id: "$token.sub" },
+          evaluations: [
+            { action: { name: "read" }, resource: { type: "file", id: "$params.arguments.a" } },
+            { action: { name: "read" }, resource: { type: "file", id: "$params.arguments.b" } },
+            { action: { name: "read" }, resource: { type: "file", id: "$params.arguments.c" } },
+          ],
+        },
+      };
+      const tape = await writeDirTape(dir, [
+        ["client_to_server", req(1, "tools/list")],
+        ["server_to_client", res(1, catalog(tool("tri", triMapping), tool("after")))],
+        ["client_to_server", call(2, "tri", { a: "/a", b: "/b", c: "/c" })],
+        ["server_to_client", res(2, {})],
+        ["client_to_server", call(3, "after")],
+        ["server_to_client", res(3, {})],
+      ]);
+      const claims = await writeClaims(dir, CLAIMS);
+      const pdp = await startPdp((body, res) => {
+        const rid = (body.resource as { id: string }).id;
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(rid === "/b" ? "garbage" : JSON.stringify({ decision: true }));
+      });
+      const j = await runAuditJson(tape, claims, ["--evaluation-endpoint", pdp.evalUrl]);
+      expect(j.code).toBe(2);
+      expect(j.parsed.status).toBe("error");
+      const failed = j.parsed.actions[0]!;
+      expect(failed.status).toBe("pdp_error");
+      expect(failed.pdpRequestCount).toBe(2);
+      expect(failed.decisionCount).toBe(1);
+      expect(failed.decisions).toEqual([{ decision: true, context: null }]);
+      const later = j.parsed.actions[1]!;
+      expect(later.status).toBe("not_evaluated");
+      expect(later.pdpRequestCount).toBe(0);
+      expect(later.decisionCount).toBe(0);
+      expect(pdp.captured).toHaveLength(2);
+      expect(j.parsed.pdpErrorCount).toBe(1);
+      expect(j.parsed.notEvaluatedCount).toBe(1);
     });
 
     it("fatal tape/token failures send zero PDP requests", async () => {

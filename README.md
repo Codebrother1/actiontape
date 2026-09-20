@@ -297,13 +297,15 @@ on live traffic. Key behaviors:
   sent to your PDP — inspect with `authzen render` first if desired. Audit
   output reports decisions and PDP `context`, not request bodies.
 - PDP/transport failures (timeout, redirect, HTTP error, malformed or
-  count-mismatched responses) are fatal: later actions are marked
-  `not_evaluated`, status is `error`, exit `2`.
+  count-mismatched responses) are fatal: the action whose request failed is
+  `pdp_error` — attempted, but no trustworthy complete decision set — while
+  later renderable actions are `not_evaluated` (zero requests sent). Status is
+  `error`, exit `2`.
 
 Exit codes: `0` = `pass` (everything evaluated and permitted), `1` = `deny`
 (at least one denial) or `incomplete` (any UNKNOWN/mapping error), `2` =
 `error` (tape/claims/PDP failure). Per-action status is one of `permit`,
-`deny`, `unknown`, `mapping_error`, `not_evaluated`.
+`deny`, `unknown`, `mapping_error`, `pdp_error`, `not_evaluated`.
 
 `authzen simulate` remains the Milestone-4 explicit default-mapping simulator;
 `authzen audit` is the historical evidence-aware declared/default audit.
