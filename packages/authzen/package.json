@@ -20,6 +20,7 @@
     "test": "vitest run"
   },
   "dependencies": {
-    "@actiontape/core": "workspace:*"
+    "@actiontape/core": "workspace:*",
+    "@marcbachmann/cel-js": "8.0.0"
   }
 }

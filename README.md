@@ -170,7 +170,8 @@ The default mapping sends only `{subject: {type:"identity", id:<subject-id>},
 action: {name:"tools/call"}, resource: {type:"tool", id:<tool name>}}`, plus
 `context.agent` when `--agent-id` is given. **Tool arguments are not
 transmitted** — argument-aware authorization requires a declared
-`x-authzen-mapping`, which is not implemented yet (nor is CEL).
+`x-authzen-mapping`. A library-level renderer for declared mappings now exists
+(see below), but it is not yet wired into `export`/`simulate`.
 
 `--subject-id` / `--agent-id` are simulation inputs supplied by you. A tape does
 not prove which identity originally made the calls; ActionTape asserts nothing
@@ -205,8 +206,21 @@ invalidation — and reports, per `tools/call` action:
 
 Exit codes: `0` all actions known, `1` one or more UNKNOWN, `2` analysis could
 not safely run. `export`/`simulate` still always use the explicit default
-mapping — use `plan` to see whether a recorded tool declared one. CEL and
-`x-authzen-mapping` evaluation are not implemented yet.
+mapping — use `plan` to see whether a recorded tool declared one.
+
+### Declared-mapping renderer (library, not yet in the CLI)
+
+`@actiontape/authzen` includes a pure, deterministic renderer for declared
+COAZ-MCP `x-authzen-mapping` templates (`renderCoazMapping`). Strings prefixed
+`$` are CEL expressions evaluated by `@marcbachmann/cel-js` over two data-only
+inputs — `params` (the recorded `tools/call` params) and `token` (simulated
+claims supplied by the caller; ActionTape never reads or validates JWTs).
+`$$` escapes a literal dollar, `evaluation` and `evaluations` envelopes are
+both supported, and `.?` optional selection omits absent properties while
+preserving present `null`/`false`/`0`/`""`. CEL integers outside the safe JSON
+number range are rejected rather than rounded. Rendering produces validated
+AuthZEN request JSON only — it contacts no PDP, decides nothing, and is not
+yet used by `authzen simulate`/`export`, which remain default-mapping only.
 
 ## Packages
 

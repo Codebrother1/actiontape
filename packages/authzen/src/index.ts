@@ -3,3 +3,8 @@ export * from "./errors.js";
 export * from "./map.js";
 export * from "./client.js";
 export * from "./simulate.js";
+export * from "./coaz-types.js";
+export { evaluateCoazExpression } from "./cel.js";
+export type { CoazExpressionResult } from "./cel.js";
+export { renderCoazMapping } from "./coaz-render.js";
+export type { CoazRenderVariables } from "./coaz-render.js";

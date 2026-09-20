@@ -11,3 +11,10 @@ export class AuthzenRequestError extends Error {
     this.name = "AuthzenRequestError";
   }
 }
+
+export class CoazMappingError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "CoazMappingError";
+  }
+}
