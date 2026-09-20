@@ -20,6 +20,7 @@
     "test": "vitest run"
   },
   "dependencies": {
-    "@actiontape/core": "workspace:*"
+    "@actiontape/core": "workspace:*",
+    "yaml": "^2.9.1"
   }
 }

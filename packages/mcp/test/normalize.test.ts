@@ -340,6 +340,29 @@ describe("ignored non-tools/call requests", () => {
     expect(diagnostics).toEqual([]);
   });
 
+  it("produces no actions and no diagnostics for modern server/discover", () => {
+    const { actions, diagnostics } = normalizeMcpTape([
+      wire(
+        "client_to_server",
+        {
+          jsonrpc: "2.0",
+          id: "discover-1",
+          method: "server/discover",
+          params: {
+            _meta: {
+              "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+              "io.modelcontextprotocol/clientCapabilities": {},
+            },
+          },
+        },
+        0,
+      ),
+      resultResponse(1, "discover-1", { protocolVersion: "2026-07-28", serverInfo: {} }),
+    ]);
+    expect(actions).toEqual([]);
+    expect(diagnostics).toEqual([]);
+  });
+
   it("produces no actions and no diagnostics for tools/list", () => {
     const { actions, diagnostics } = normalizeMcpTape([
       wire("client_to_server", { jsonrpc: "2.0", id: "l1", method: "tools/list" }, 0),

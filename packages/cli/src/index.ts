@@ -1,3 +1,4 @@
+import { readFile } from "node:fs/promises";
 import { constants as osConstants } from "node:os";
 import type { Readable, Writable } from "node:stream";
 import {
@@ -5,6 +6,12 @@ import {
   isJsonObject,
   type ActionEnvelope,
 } from "@actiontape/core";
+import {
+  ContractParseError,
+  evaluateContract,
+  parseContract,
+  type ContractViolation,
+} from "@actiontape/contracts";
 import {
   JsonlTapeWriter,
   normalizeMcpTape,
@@ -22,6 +29,8 @@ Usage:
   actiontape record --out <path> -- <command> [args...]   Record MCP stdio traffic to a JSONL tape
   actiontape inspect <tape>                             Inspect a tape (read-only)
   actiontape inspect --json <tape>                      Emit normalized actions as JSONL
+  actiontape check <tape> --contract <path>             Evaluate a contract against a tape
+  actiontape check --json <tape> --contract <path>      Emit the check result as one JSON object
   actiontape --help                                     Show this help
   actiontape --version                                  Print version
 
@@ -35,6 +44,9 @@ Experimental: stdio recording only. No replay, redaction, or policy yet.
 
 const RECORD_USAGE = `usage: actiontape record --out <path> -- <command> [args...]`;
 const INSPECT_USAGE = `usage: actiontape inspect [--json] <tape>`;
+const CHECK_USAGE = `usage: actiontape check [--json] <tape> --contract <path>
+
+exit codes: 0 = contract passed, 1 = violations found, 2 = evaluation error`;
 
 const RESPONSE_KIND_LABELS: Record<string, string> = {
   success: "success",
@@ -213,6 +225,144 @@ async function runInspect(
   return 0;
 }
 
+interface CheckResult {
+  schemaVersion: "1.0";
+  status: "pass" | "fail" | "error";
+  actionCount: number;
+  ruleCount: number;
+  violationCount: number;
+  violations: ContractViolation[];
+  diagnostics: NormalizationDiagnostic[];
+  error: string | null;
+}
+
+async function runCheck(
+  argv: string[],
+  io: CliIo,
+  log: (line: string) => void,
+  error: (line: string) => void,
+): Promise<number> {
+  let json = false;
+  let path: string | undefined;
+  let contractPath: string | undefined;
+  for (let i = 0; i < argv.length; i += 1) {
+    const arg = argv[i]!;
+    if (arg === "--json") {
+      json = true;
+    } else if (arg === "--contract") {
+      const value = argv[i + 1];
+      if (value === undefined) {
+        error("actiontape check: --contract requires a path");
+        error(CHECK_USAGE);
+        return 2;
+      }
+      contractPath = value;
+      i += 1;
+    } else if (arg.startsWith("--contract=")) {
+      contractPath = arg.slice("--contract=".length);
+    } else if (arg === "--help" || arg === "-h") {
+      log(CHECK_USAGE);
+      return 0;
+    } else if (arg.startsWith("-")) {
+      error(`actiontape check: unknown option ${arg}`);
+      error(CHECK_USAGE);
+      return 2;
+    } else if (path === undefined) {
+      path = arg;
+    } else {
+      error(`actiontape check: unexpected argument ${arg}`);
+      error(CHECK_USAGE);
+      return 2;
+    }
+  }
+  if (path === undefined) {
+    error("actiontape check: missing tape path");
+    error(CHECK_USAGE);
+    return 2;
+  }
+  if (contractPath === undefined) {
+    error("actiontape check: missing required --contract <path>");
+    error(CHECK_USAGE);
+    return 2;
+  }
+
+  const result: CheckResult = {
+    schemaVersion: "1.0",
+    status: "error",
+    actionCount: 0,
+    ruleCount: 0,
+    violationCount: 0,
+    violations: [],
+    diagnostics: [],
+    error: null,
+  };
+  const finish = (exitCode: number): number => {
+    if (json) {
+      const out = io.out ?? process.stdout;
+      out.write(JSON.stringify(result) + "\n");
+    }
+    return exitCode;
+  };
+  const fail = (message: string): number => {
+    result.error = message;
+    error(`actiontape check: ${message}`);
+    return finish(2);
+  };
+
+  const entries: TapeEntry[] = [];
+  try {
+    for await (const entry of readTapeFile(path)) {
+      entries.push(entry);
+    }
+  } catch (err) {
+    return fail(err instanceof Error ? err.message : String(err));
+  }
+
+  const { actions, diagnostics } = normalizeMcpTape(entries);
+  result.actionCount = actions.length;
+  result.diagnostics = diagnostics;
+
+  let contractText: string;
+  try {
+    contractText = await readFile(contractPath, "utf8");
+  } catch (err) {
+    return fail(err instanceof Error ? err.message : String(err));
+  }
+  let contract;
+  try {
+    contract = parseContract(contractText);
+  } catch (err) {
+    return fail(
+      err instanceof ContractParseError ? err.message : `invalid contract: ${String(err)}`,
+    );
+  }
+  result.ruleCount = contract.rules.length;
+
+  // Fail closed: any normalization diagnostic means the tape cannot be trusted.
+  if (diagnostics.length > 0) {
+    for (const d of diagnostics) {
+      error(formatDiagnostic(d));
+    }
+    return fail(`tape produced ${diagnostics.length} normalization diagnostic(s)`);
+  }
+
+  const evaluation = evaluateContract(contract, actions);
+  result.violations = evaluation.violations;
+  result.violationCount = evaluation.violations.length;
+  result.status = evaluation.ok ? "pass" : "fail";
+
+  if (json) return finish(evaluation.ok ? 0 : 1);
+
+  log(`${evaluation.ok ? "PASS" : "FAIL"} ${contractPath}`);
+  log(`actions: ${actions.length}`);
+  log(`rules: ${contract.rules.length}`);
+  log(`violations: ${evaluation.violations.length}`);
+  for (const v of evaluation.violations) {
+    log(`[${v.ruleId}] ${v.message}`);
+  }
+  return evaluation.ok ? 0 : 1;
+}
+
 export async function main(argv: string[], io: CliIo = {}): Promise<number> {
   const log = io.log ?? console.log;
   const error = io.error ?? console.error;
@@ -222,6 +372,9 @@ export async function main(argv: string[], io: CliIo = {}): Promise<number> {
   }
   if (argv[0] === "inspect") {
     return runInspect(argv.slice(1), io, log, error);
+  }
+  if (argv[0] === "check") {
+    return runCheck(argv.slice(1), io, log, error);
   }
   if (argv.includes("--version") || argv.includes("-v")) {
     log(`actiontape ${CLI_VERSION} (envelope schema ${ACTION_ENVELOPE_SCHEMA_VERSION})`);

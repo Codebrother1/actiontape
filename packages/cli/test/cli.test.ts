@@ -228,3 +228,183 @@ describe("actiontape inspect", () => {
     expect(await main(["inspect", "--bogus", "x"], io)).toBe(2);
   });
 });
+
+describe("actiontape check", () => {
+  async function writeTape(dir: string, raws: string[]): Promise<string> {
+    const tapePath = join(dir, "tape.agentlog");
+    const lines = raws.map((raw, i) =>
+      JSON.stringify(
+        createWireRecord({
+          recordingId: "rec-check",
+          sequence: i,
+          direction: i % 2 === 0 ? "client_to_server" : "server_to_client",
+          raw,
+        }),
+      ),
+    );
+    await writeFile(tapePath, lines.join("\n") + "\n", "utf8");
+    return tapePath;
+  }
+
+  async function writeContract(dir: string, text: string): Promise<string> {
+    const contractPath = join(dir, "contract.yaml");
+    await writeFile(contractPath, text, "utf8");
+    return contractPath;
+  }
+
+  const PR_CALL = JSON.stringify({
+    jsonrpc: "2.0",
+    id: 1,
+    method: "tools/call",
+    params: { name: "create_pull_request", arguments: { base: "main", title: "x" } },
+  });
+  const PR_RESULT = JSON.stringify({
+    jsonrpc: "2.0",
+    id: 1,
+    result: { resultType: "complete", content: [] },
+  });
+  const PASSING_CONTRACT = `contractVersion: "1.0"
+rules:
+  - id: no-delete
+    type: deny
+    match:
+      target: "delete_*"
+  - id: budget
+    type: max_calls
+    max: 5
+  - id: pr-base
+    type: require_argument
+    match:
+      target: create_pull_request
+    path: /base
+    operator: equals
+    value: main
+`;
+
+  it("exits 0 on a passing contract", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "actiontape-check-"));
+    const tape = await writeTape(dir, [PR_CALL, PR_RESULT]);
+    const contract = await writeContract(dir, PASSING_CONTRACT);
+    const { io, lines } = captureIo();
+    expect(await main(["check", tape, "--contract", contract], io)).toBe(0);
+    expect(lines.join("\n")).toContain("PASS");
+    expect(lines.join("\n")).toContain("violations: 0");
+  });
+
+  it("exits 1 on contract violations", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "actiontape-check-"));
+    const tape = await writeTape(dir, [PR_CALL, PR_RESULT]);
+    const contract = await writeContract(
+      dir,
+      `contractVersion: "1.0"\nrules:\n  - id: pr-base\n    type: require_argument\n    match:\n      target: create_pull_request\n    path: /base\n    operator: equals\n    value: develop\n`,
+    );
+    const { io, lines } = captureIo();
+    expect(await main(["check", tape, "--contract", contract], io)).toBe(1);
+    const output = lines.join("\n");
+    expect(output).toContain("FAIL");
+    expect(output).toContain("[pr-base]");
+    expect(output).toContain('"develop"');
+  });
+
+  it("exits 2 on a malformed contract", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "actiontape-check-"));
+    const tape = await writeTape(dir, [PR_CALL, PR_RESULT]);
+    const contract = await writeContract(dir, `contractVersion: "9.9"\nrules: nope\n`);
+    const { io, errors } = captureIo();
+    expect(await main(["check", tape, "--contract", contract], io)).toBe(2);
+    expect(errors.join("\n")).toContain("actiontape check:");
+  });
+
+  it("exits 2 when the tape produces normalization diagnostics", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "actiontape-check-"));
+    const orphan = JSON.stringify({ jsonrpc: "2.0", id: 99, result: {} });
+    const tapePath = join(dir, "tape.agentlog");
+    await writeFile(
+      tapePath,
+      JSON.stringify(
+        createWireRecord({
+          recordingId: "rec-check",
+          sequence: 0,
+          direction: "server_to_client",
+          raw: orphan,
+        }),
+      ) + "\n",
+      "utf8",
+    );
+    const contract = await writeContract(dir, PASSING_CONTRACT);
+    const { io, errors } = captureIo();
+    expect(await main(["check", tapePath, "--contract", contract], io)).toBe(2);
+    expect(errors.join("\n")).toContain("unmatched_response");
+  });
+
+  it("emits exactly one JSON object with --json on pass, fail, and error", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "actiontape-check-"));
+    const tape = await writeTape(dir, [PR_CALL, PR_RESULT]);
+    const pass = await writeContract(dir, PASSING_CONTRACT);
+    const failContract = await writeFile(
+      join(dir, "fail.yaml"),
+      `contractVersion: "1.0"\nrules: [{ id: d, type: deny }]\n`,
+      "utf8",
+    ).then(() => join(dir, "fail.yaml"));
+    const bad = join(dir, "bad.yaml");
+    await writeFile(bad, "contractVersion: 0\nrules: nope\n", "utf8");
+
+    const runJson = async (contractPath: string) => {
+      const out = sink();
+      const { io } = captureIo();
+      const code = await main(["check", "--json", tape, "--contract", contractPath], {
+        ...io,
+        out: out.stream,
+      });
+      const text = out.text();
+      const parsed = JSON.parse(text) as Record<string, unknown>;
+      return { code, text, parsed };
+    };
+
+    const p = await runJson(pass);
+    expect(p.code).toBe(0);
+    expect(p.parsed.status).toBe("pass");
+    expect(p.parsed.violations).toEqual([]);
+
+    const f = await runJson(failContract);
+    expect(f.code).toBe(1);
+    expect(f.parsed.status).toBe("fail");
+    expect(f.parsed.violationCount).toBe(1);
+
+    const e = await runJson(bad);
+    expect(e.code).toBe(2);
+    expect(e.parsed.status).toBe("error");
+    expect(typeof e.parsed.error).toBe("string");
+
+    for (const r of [p, f, e]) {
+      expect(r.text.trim().split("\n")).toHaveLength(1);
+    }
+  });
+
+  it("treats command-like strings in tapes and contracts as inert data", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "actiontape-check-"));
+    const marker = join(dir, "should-never-exist");
+    const evilCall = JSON.stringify({
+      jsonrpc: "2.0",
+      id: 1,
+      method: "tools/call",
+      params: { name: "run", arguments: { cmd: `touch ${marker}` } },
+    });
+    const evilResult = JSON.stringify({ jsonrpc: "2.0", id: 1, result: {} });
+    const tape = await writeTape(dir, [evilCall, evilResult]);
+    const contract = await writeContract(
+      dir,
+      `contractVersion: "1.0"\nrules:\n  - id: r\n    type: require_argument\n    path: /cmd\n    operator: equals\n    value: "touch ${marker}"\n`,
+    );
+    const { io } = captureIo();
+    expect(await main(["check", tape, "--contract", contract], io)).toBe(0);
+    expect(existsSync(marker)).toBe(false);
+  });
+
+  it("rejects check without --contract and with unknown options", async () => {
+    const { io, errors } = captureIo();
+    expect(await main(["check", "some.agentlog"], io)).toBe(2);
+    expect(await main(["check", "--bogus"], io)).toBe(2);
+    expect(errors.join("\n")).toContain("--contract");
+  });
+});
