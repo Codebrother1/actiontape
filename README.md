@@ -6,9 +6,10 @@ policy-simulation layer for AI agent tool calls. Initial protocol target:
 
 > **Status: early / experimental.** Working features today: transparent
 > **stdio recording** of MCP traffic, **read-only tape inspection**
-> (`inspect` / `inspect --json`), and **deterministic contract checks**
-> (`check`). Replay, diffing, redaction, and policy simulation are not
-> implemented yet.
+> (`inspect` / `inspect --json`), **deterministic contract checks** (`check`),
+> and **counterfactual AuthZEN simulation** (`authzen export` / `authzen
+simulate`). Replay, diffing, redaction, and runtime policy enforcement are
+> not implemented yet.
 
 ## What problem is this trying to solve?
 
@@ -138,8 +139,47 @@ normalization diagnostic — checks fail closed).
 
 Contracts operate on **recorded, normalized** actions. Each MRTR wire round
 counts as an independent action; logical grouping is deferred. ActionTape
-evaluates observed behavior only — it does not yet enforce authorization policy
-at execution time (no Cedar/AuthZEN/policy simulation yet).
+evaluates observed behavior only — it does not enforce authorization policy at
+execution time.
+
+## Simulating authorization over a recording
+
+`authzen` maps each recorded MCP `tools/call` action to an AuthZEN Access
+Evaluation request using the **COAZ-MCP Draft 1 default `tools/call` mapping**
+and can submit those requests to an AuthZEN-compatible Policy Decision Point.
+This is **historical simulation**: it replays nothing, executes no tools, and
+enforces no live traffic.
+
+```sh
+# Emit one Access Evaluation request per action (JSONL on stdout)
+actiontape authzen export ./my-run.agentlog \
+  --subject-id alice@example.com --agent-id my-agent
+
+# POST each request sequentially to a PDP and summarize decisions
+actiontape authzen simulate ./my-run.agentlog \
+  --endpoint http://localhost:8080/access/v1/evaluation \
+  --subject-id alice@example.com --agent-id my-agent \
+  [--timeout-ms 5000] [--json]
+```
+
+The default mapping sends only `{subject: {type:"identity", id:<subject-id>},
+action: {name:"tools/call"}, resource: {type:"tool", id:<tool name>}}`, plus
+`context.agent` when `--agent-id` is given. **Tool arguments are not
+transmitted** — argument-aware authorization requires a declared
+`x-authzen-mapping`, which is not implemented yet (nor is CEL).
+
+`--subject-id` / `--agent-id` are simulation inputs supplied by you. A tape does
+not prove which identity originally made the calls; ActionTape asserts nothing
+about the identities in the original recording and never reads JWTs or
+credentials. You choose the PDP endpoint explicitly — requests carry no
+cookies, credentials, or redirects.
+
+Simulate exit codes: `0` all permitted, `1` one or more denied (a deny is a
+successful evaluation, not an error), `2` ActionTape could not safely complete
+the run (bad tape/diagnostics, mapping error, unreachable/misbehaving PDP).
+`--json` emits exactly one object: `{status: "pass"|"deny"|"error", ...}`.
+`export` exits `0` on success or `2` on error. Each MRTR wire round is a
+separate evaluation, matching normalization.
 
 ## Packages
 
@@ -151,7 +191,10 @@ at execution time (no Cedar/AuthZEN/policy simulation yet).
 - `@actiontape/recorder` — minimal in-memory tape recorder
 - `@actiontape/contracts` — strict contract parser (YAML/JSON) and
   deterministic rule evaluator over `ActionEnvelope[]`
-- `@actiontape/cli` — `actiontape` CLI (`record`, `inspect`, `check`)
+- `@actiontape/authzen` — COAZ-MCP Draft 1 default `tools/call` mapping,
+  AuthZEN Access Evaluation client, and sequential simulation engine
+- `@actiontape/cli` — `actiontape` CLI (`record`, `inspect`, `check`,
+  `authzen`)
 
 ## Development
 

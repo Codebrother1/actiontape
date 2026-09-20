@@ -1,4 +1,6 @@
 import { existsSync } from "node:fs";
+import { createServer, type Server, type IncomingMessage, type ServerResponse } from "node:http";
+import type { AddressInfo } from "node:net";
 import { mkdtemp, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -430,5 +432,297 @@ rules:
     expect(await main(["check", "some.agentlog"], io)).toBe(2);
     expect(await main(["check", "--bogus"], io)).toBe(2);
     expect(errors.join("\n")).toContain("--contract");
+  });
+});
+
+describe("actiontape authzen", () => {
+  async function writeTape(dir: string, raws: string[]): Promise<string> {
+    const tapePath = join(dir, "tape.agentlog");
+    const lines = raws.map((raw, i) =>
+      JSON.stringify(
+        createWireRecord({
+          recordingId: "rec-az",
+          sequence: i,
+          direction: i % 2 === 0 ? "client_to_server" : "server_to_client",
+          raw,
+        }),
+      ),
+    );
+    await writeFile(tapePath, lines.join("\n") + "\n", "utf8");
+    return tapePath;
+  }
+
+  const call = (id: number, name: string, args: Record<string, unknown> = {}) =>
+    JSON.stringify({ jsonrpc: "2.0", id, method: "tools/call", params: { name, arguments: args } });
+  const ok = (id: number) =>
+    JSON.stringify({ jsonrpc: "2.0", id, result: { resultType: "complete", content: [] } });
+
+  async function writeThreeToolTape(dir: string): Promise<string> {
+    return writeTape(dir, [
+      call(1, "get_weather", { location: "NYC" }),
+      ok(1),
+      call(2, "delete_file", { path: "/tmp/x" }),
+      ok(2),
+      call(3, "search", { q: "abc" }),
+      ok(3),
+    ]);
+  }
+
+  describe("export", () => {
+    it("emits one default-mapped JSONL request per action", async () => {
+      const dir = await mkdtemp(join(tmpdir(), "actiontape-az-"));
+      const tape = await writeThreeToolTape(dir);
+      const out = sink();
+      const { io } = captureIo();
+      const code = await main(
+        ["authzen", "export", tape, "--subject-id", "alice@example.com", "--agent-id", "bot-1"],
+        { ...io, out: out.stream },
+      );
+      expect(code).toBe(0);
+      const lines = out.text().trim().split("\n");
+      expect(lines).toHaveLength(3);
+      const reqs = lines.map(
+        (l) => JSON.parse(l) as { resource: { id: string }; context?: unknown },
+      );
+      expect(reqs[0]).toEqual({
+        subject: { type: "identity", id: "alice@example.com" },
+        action: { name: "tools/call" },
+        resource: { type: "tool", id: "get_weather" },
+        context: { agent: "bot-1" },
+      });
+      expect(reqs.map((r) => r.resource.id)).toEqual(["get_weather", "delete_file", "search"]);
+      // Tool arguments must not leak into the exported requests.
+      for (const l of lines) {
+        expect(l).not.toContain("NYC");
+        expect(l).not.toContain("/tmp/x");
+        expect(l).not.toContain("abc");
+        expect(l).not.toContain("arguments");
+      }
+    });
+
+    it("omits context without --agent-id and requires --subject-id", async () => {
+      const dir = await mkdtemp(join(tmpdir(), "actiontape-az-"));
+      const tape = await writeTape(dir, [call(1, "t"), ok(1)]);
+      const out = sink();
+      const { io, errors } = captureIo();
+      expect(
+        await main(["authzen", "export", tape, "--subject-id", "s"], { ...io, out: out.stream }),
+      ).toBe(0);
+      const req = JSON.parse(out.text().trim()) as Record<string, unknown>;
+      expect(req.context).toBeUndefined();
+      expect(await main(["authzen", "export", tape], io)).toBe(2);
+      expect(errors.join("\n")).toContain("--subject-id");
+    });
+
+    it("fails closed on normalization diagnostics and emits nothing", async () => {
+      const dir = await mkdtemp(join(tmpdir(), "actiontape-az-"));
+      const tapePath = join(dir, "tape.agentlog");
+      await writeFile(tapePath, "garbage\n", "utf8");
+      const out = sink();
+      const { io, errors } = captureIo();
+      expect(
+        await main(["authzen", "export", tapePath, "--subject-id", "s"], {
+          ...io,
+          out: out.stream,
+        }),
+      ).toBe(2);
+      expect(out.text()).toBe("");
+      expect(errors.join("\n")).toContain("malformed_jsonl");
+    });
+
+    it("succeeds with empty output for a tape with no tool calls", async () => {
+      const dir = await mkdtemp(join(tmpdir(), "actiontape-az-"));
+      const initReq = JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list" });
+      const initRes = JSON.stringify({ jsonrpc: "2.0", id: 1, result: {} });
+      const tape = await writeTape(dir, [initReq, initRes]);
+      const out = sink();
+      const { io } = captureIo();
+      expect(
+        await main(["authzen", "export", tape, "--subject-id", "s"], { ...io, out: out.stream }),
+      ).toBe(0);
+      expect(out.text()).toBe("");
+    });
+  });
+
+  describe("simulate", () => {
+    let pdp: Server | undefined;
+    const requests: { resource: { id: string } }[] = [];
+
+    async function startPdp(
+      handler: (body: { resource: { id: string } }, res: ServerResponse) => void,
+    ): Promise<string> {
+      pdp = createServer((req: IncomingMessage, res: ServerResponse) => {
+        const chunks: Buffer[] = [];
+        req.on("data", (c) => chunks.push(c));
+        req.on("end", () => {
+          const body = JSON.parse(Buffer.concat(chunks).toString("utf8")) as {
+            resource: { id: string };
+          };
+          requests.push(body);
+          handler(body, res);
+        });
+      });
+      await new Promise<void>((r) => pdp!.listen(0, "127.0.0.1", r));
+      const port = (pdp!.address() as AddressInfo).port;
+      return `http://127.0.0.1:${port}/access/v1/evaluation`;
+    }
+    const stopPdp = () => new Promise((r) => pdp?.close(r));
+
+    it("exits 0 when all permitted, 1 when any denied, preserving order", async () => {
+      const dir = await mkdtemp(join(tmpdir(), "actiontape-az-"));
+      const tape = await writeThreeToolTape(dir);
+
+      const all = await startPdp((_b, res) => {
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ decision: true }));
+      });
+      const { io, lines } = captureIo();
+      const code = await main(
+        ["authzen", "simulate", tape, "--endpoint", all, "--subject-id", "alice"],
+        io,
+      );
+      expect(code).toBe(0);
+      const output = lines.join("\n");
+      expect(output).toContain("AUTHZEN PASS");
+      expect(output).toContain("permitted: 3");
+      expect(requests).toHaveLength(3);
+      await stopPdp();
+      requests.length = 0;
+
+      const deny = await startPdp((b, res) => {
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ decision: b.resource.id !== "delete_file" }));
+      });
+      const { io: io2, lines: lines2 } = captureIo();
+      const code2 = await main(
+        ["authzen", "simulate", tape, "--endpoint", deny, "--subject-id", "alice"],
+        io2,
+      );
+      expect(code2).toBe(1);
+      const out2 = lines2.join("\n");
+      expect(out2).toContain("AUTHZEN DENY");
+      expect(out2).toContain("denied: 1");
+      expect(out2).toContain("DENY delete_file");
+      // Deny does not stop later evaluations: all 3 reached the PDP in order.
+      expect(requests.map((r) => r.resource.id)).toEqual(["get_weather", "delete_file", "search"]);
+      // No tool arguments reach the PDP.
+      for (const r of requests) {
+        expect(JSON.stringify(r)).not.toContain("/tmp/x");
+        expect(JSON.stringify(r)).not.toContain("arguments");
+      }
+      await stopPdp();
+      requests.length = 0;
+    });
+
+    it("exits 2 on PDP failure and stops further requests", async () => {
+      const dir = await mkdtemp(join(tmpdir(), "actiontape-az-"));
+      const tape = await writeThreeToolTape(dir);
+      const url = await startPdp((b, res) => {
+        res.writeHead(b.resource.id === "get_weather" ? 200 : 500);
+        res.end(JSON.stringify({ decision: true }));
+      });
+      const { io, errors } = captureIo();
+      expect(
+        await main(["authzen", "simulate", tape, "--endpoint", url, "--subject-id", "s"], io),
+      ).toBe(2);
+      expect(requests).toHaveLength(2); // failed closed after HTTP 500
+      expect(errors.join("\n")).toContain("HTTP 500");
+      await stopPdp();
+      requests.length = 0;
+    });
+
+    it("exits 2 on normalization diagnostics without contacting the PDP", async () => {
+      const dir = await mkdtemp(join(tmpdir(), "actiontape-az-"));
+      const tapePath = join(dir, "tape.agentlog");
+      await writeFile(tapePath, "garbage\n", "utf8");
+      const url = await startPdp((_b, res) => res.end(JSON.stringify({ decision: true })));
+      const { io } = captureIo();
+      expect(
+        await main(["authzen", "simulate", tapePath, "--endpoint", url, "--subject-id", "s"], io),
+      ).toBe(2);
+      expect(requests).toHaveLength(0);
+      await stopPdp();
+    });
+
+    it("emits exactly one JSON object for pass, deny, and error", async () => {
+      const dir = await mkdtemp(join(tmpdir(), "actiontape-az-"));
+      const tape = await writeThreeToolTape(dir);
+
+      const runJson = async (endpoint: string) => {
+        const out = sink();
+        const { io } = captureIo();
+        const code = await main(
+          ["authzen", "simulate", "--json", tape, "--endpoint", endpoint, "--subject-id", "s"],
+          { ...io, out: out.stream },
+        );
+        const text = out.text();
+        return { code, parsed: JSON.parse(text) as Record<string, unknown>, text };
+      };
+
+      const permit = await startPdp((_b, res) => res.end(JSON.stringify({ decision: true })));
+      const p = await runJson(permit);
+      expect(p.code).toBe(0);
+      expect(p.parsed.status).toBe("pass");
+      expect(p.parsed.permitCount).toBe(3);
+      await stopPdp();
+      requests.length = 0;
+
+      const deny = await startPdp((b, res) =>
+        res.end(JSON.stringify({ decision: b.resource.id !== "search" })),
+      );
+      const d = await runJson(deny);
+      expect(d.code).toBe(1);
+      expect(d.parsed.status).toBe("deny");
+      expect(d.parsed.denyCount).toBe(1);
+      await stopPdp();
+      requests.length = 0;
+
+      const broken = await startPdp((_b, res) => res.end("not json"));
+      const e = await runJson(broken);
+      expect(e.code).toBe(2);
+      expect(e.parsed.status).toBe("error");
+      expect(typeof e.parsed.error).toBe("string");
+      await stopPdp();
+      requests.length = 0;
+
+      for (const r of [p, d, e]) {
+        expect(r.text.trim().split("\n")).toHaveLength(1);
+      }
+    });
+
+    it("exits 2 on missing endpoint, bad scheme, and timeout", async () => {
+      const dir = await mkdtemp(join(tmpdir(), "actiontape-az-"));
+      const tape = await writeTape(dir, [call(1, "t"), ok(1)]);
+      const { io, errors } = captureIo();
+      expect(await main(["authzen", "simulate", tape, "--subject-id", "s"], io)).toBe(2);
+      expect(errors.join("\n")).toContain("--endpoint");
+
+      expect(
+        await main(
+          ["authzen", "simulate", tape, "--endpoint", "file:///x", "--subject-id", "s"],
+          io,
+        ),
+      ).toBe(2);
+
+      const slow = await startPdp(() => {});
+      expect(
+        await main(
+          [
+            "authzen",
+            "simulate",
+            tape,
+            "--endpoint",
+            slow,
+            "--subject-id",
+            "s",
+            "--timeout-ms",
+            "50",
+          ],
+          io,
+        ),
+      ).toBe(2);
+      expect(errors.join("\n")).toContain("timed out");
+      await stopPdp();
+    });
   });
 });

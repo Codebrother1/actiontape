@@ -33,8 +33,17 @@ importers:
         specifier: ^3.2.4
         version: 3.2.7(@types/node@22.20.4)(yaml@2.9.1)
 
+  packages/authzen:
+    dependencies:
+      '@actiontape/core':
+        specifier: workspace:*
+        version: link:../core
+
   packages/cli:
     dependencies:
+      '@actiontape/authzen':
+        specifier: workspace:*
+        version: link:../authzen
       '@actiontape/contracts':
         specifier: workspace:*
         version: link:../contracts
