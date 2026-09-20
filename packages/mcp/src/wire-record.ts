@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { isJsonValue, type JsonValue } from "@actiontape/core";
+import { isJsonObject, isJsonValue, type JsonValue } from "@actiontape/core";
 
 export const MCP_WIRE_RECORD_SCHEMA_VERSION = "0.1-experimental";
 
@@ -56,4 +56,27 @@ export function createWireRecord(init: McpWireRecordInit): McpWireRecord {
 
 export function newRecordingId(): string {
   return randomUUID();
+}
+
+export function isWireParseResult(value: unknown): value is WireParseResult {
+  return (
+    isJsonObject(value) &&
+    ((value.status === "ok" && isJsonValue(value.value)) ||
+      (value.status === "error" && typeof value.message === "string"))
+  );
+}
+
+export function isMcpWireRecord(value: unknown): value is McpWireRecord {
+  return (
+    isJsonObject(value) &&
+    value.schemaVersion === MCP_WIRE_RECORD_SCHEMA_VERSION &&
+    typeof value.recordingId === "string" &&
+    typeof value.sequence === "number" &&
+    Number.isInteger(value.sequence) &&
+    typeof value.timestamp === "string" &&
+    value.transport === "stdio" &&
+    (value.direction === "client_to_server" || value.direction === "server_to_client") &&
+    typeof value.raw === "string" &&
+    isWireParseResult(value.parse)
+  );
 }

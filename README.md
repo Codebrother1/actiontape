@@ -4,9 +4,10 @@ A deterministic record/replay, contract-testing, behavior-diffing, and
 policy-simulation layer for AI agent tool calls. Initial protocol target:
 [Model Context Protocol (MCP)](https://modelcontextprotocol.io).
 
-> **Status: early / experimental.** The only working feature today is
-> transparent **stdio recording** of MCP traffic. Replay, contracts, diffing,
-> redaction, and policy simulation are not implemented yet.
+> **Status: early / experimental.** Working features today: transparent
+> **stdio recording** of MCP traffic and **read-only tape inspection**
+> (`inspect` / `inspect --json`). Replay, contracts, diffing, redaction, and
+> policy simulation are not implemented yet.
 
 ## What problem is this trying to solve?
 
@@ -68,12 +69,38 @@ actiontape record --out ./my-run.agentlog -- npx some-mcp-server --arg value
   contracts.
 - The wire record format is experimental and may change between milestones.
 
+## Inspecting a tape
+
+`inspect` reads a tape and normalizes `tools/call` JSON-RPC traffic into
+deterministic, correlated `ActionEnvelope` actions. It is strictly read-only:
+it never spawns the recorded command or replays any recorded message.
+
+```sh
+actiontape inspect ./my-run.agentlog
+actiontape inspect --json ./my-run.agentlog   # one ActionEnvelope per line
+```
+
+Normalization correlates each `tools/call` request with its JSON-RPC response
+(exact id match, distinguishing `1` from `"1"`), and classifies outcomes as
+success, protocol error, tool-execution error (`result.isError`),
+`input_required`, unknown `resultType`, or incomplete (no response observed).
+Non-`tools/call` request/response traffic (e.g. `initialize`, `tools/list`) is
+tracked for correlation but not turned into actions or reported as unmatched;
+genuinely orphaned responses are still diagnosed. Unreadable tapes fail; tapes
+with malformed lines still inspect, with diagnostics reported on stderr.
+
+MCP 2026-07-28 multi-round-trip calls (`resultType: "input_required"` followed
+by a retry under a new JSON-RPC id) are currently normalized as one
+ActionEnvelope per wire round — logical MRTR grouping is deferred because safe
+correlation across rounds cannot always be inferred.
+
 ## Packages
 
 - `@actiontape/core` — protocol-independent `ActionEnvelope` domain model and
-  a small event vocabulary (`session.started`, `action.requested`,
-  `action.completed`, `action.failed`, `session.ended`)
-- `@actiontape/mcp` — transparent stdio proxy and JSONL wire-record writer
+  a small event vocabulary (`recording.started`, `action.requested`,
+  `action.completed`, `action.failed`, `recording.ended`)
+- `@actiontape/mcp` — transparent stdio proxy, JSONL wire-record writer, tape
+  reader, and MCP `tools/call` normalizer
 - `@actiontape/recorder` — minimal in-memory tape recorder
 - `@actiontape/contracts` — minimal contract-evaluation skeleton
 - `@actiontape/cli` — `actiontape` CLI (`record`, `--help`, `--version`)

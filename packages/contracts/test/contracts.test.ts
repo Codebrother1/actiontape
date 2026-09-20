@@ -5,7 +5,7 @@ import type { ActionContract } from "../src/index.js";
 
 const envelope = createActionEnvelope({
   protocol: "mcp",
-  sessionId: "session-1",
+  recordingId: "recording-1",
   operation: "tools/call",
   target: "filesystem/read_file",
   arguments: { path: "/tmp/a.txt" },

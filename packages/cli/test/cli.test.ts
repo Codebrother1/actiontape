@@ -1,9 +1,12 @@
-import { mkdtemp, readFile } from "node:fs/promises";
+import { existsSync } from "node:fs";
+import { mkdtemp, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Readable, Writable } from "node:stream";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
+import { isActionEnvelope } from "@actiontape/core";
+import { createWireRecord } from "@actiontape/mcp";
 import { CLI_VERSION, main, type CliIo } from "../src/index.js";
 
 const EMIT_SERVER = fileURLToPath(
@@ -119,4 +122,109 @@ describe("actiontape cli", () => {
     expect(code).toBe(1);
     expect(errors.join("\n")).toContain("actiontape record:");
   }, 15000);
+});
+
+describe("actiontape inspect", () => {
+  async function writeTape(dir: string, raws: string[]): Promise<string> {
+    const tapePath = join(dir, "tape.agentlog");
+    const lines = raws.map((raw, i) =>
+      JSON.stringify(
+        createWireRecord({
+          recordingId: "rec-cli",
+          sequence: i,
+          direction: i % 2 === 0 ? "client_to_server" : "server_to_client",
+          raw,
+        }),
+      ),
+    );
+    await writeFile(tapePath, lines.join("\n") + "\n", "utf8");
+    return tapePath;
+  }
+
+  const CALL = JSON.stringify({
+    jsonrpc: "2.0",
+    id: "call-1",
+    method: "tools/call",
+    params: { name: "get_weather", arguments: { location: "New York" } },
+  });
+  const RESULT = JSON.stringify({
+    jsonrpc: "2.0",
+    id: "call-1",
+    result: { resultType: "complete", content: [{ type: "text", text: "72 F" }] },
+  });
+
+  it("prints human-readable action inspection", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "actiontape-inspect-"));
+    const tape = await writeTape(dir, [CALL, RESULT]);
+    const { io, lines } = captureIo();
+    expect(await main(["inspect", tape], io)).toBe(0);
+    const output = lines.join("\n");
+    expect(output).toContain("actions: 1");
+    expect(output).toContain("#1 tools/call get_weather — success");
+    expect(output).toContain('jsonrpc id: "call-1"');
+    expect(output).toContain('"location":"New York"');
+  });
+
+  it("emits clean ActionEnvelope JSONL on stdout with --json", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "actiontape-inspect-"));
+    const tape = await writeTape(dir, [CALL, RESULT]);
+    const out = sink();
+    const { io, lines } = captureIo();
+    const code = await main(["inspect", "--json", tape], { ...io, out: out.stream });
+    expect(code).toBe(0);
+    expect(lines).toEqual([]);
+    const parsed = out
+      .text()
+      .trim()
+      .split("\n")
+      .map((l) => JSON.parse(l) as unknown);
+    expect(parsed).toHaveLength(1);
+    expect(isActionEnvelope(parsed[0])).toBe(true);
+    const action = parsed[0] as Record<string, unknown>;
+    expect(action.target).toBe("get_weather");
+  });
+
+  it("sends diagnostics to stderr while --json stdout stays clean", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "actiontape-inspect-"));
+    const tapePath = join(dir, "tape.agentlog");
+    const valid = JSON.stringify(
+      createWireRecord({ recordingId: "r", sequence: 0, direction: "client_to_server", raw: CALL }),
+    );
+    await writeFile(tapePath, "garbage line\n" + valid + "\n", "utf8");
+    const out = sink();
+    const { io, errors } = captureIo();
+    expect(await main(["inspect", "--json", tapePath], { ...io, out: out.stream })).toBe(0);
+    expect(errors.join("\n")).toContain("malformed_jsonl");
+    for (const line of out.text().trim().split("\n")) {
+      expect(isActionEnvelope(JSON.parse(line))).toBe(true);
+    }
+  });
+
+  it("does not execute command-like strings embedded in the tape", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "actiontape-inspect-"));
+    const marker = join(dir, "should-never-exist");
+    const evilCall = JSON.stringify({
+      jsonrpc: "2.0",
+      id: 1,
+      method: "tools/call",
+      params: { name: "run", arguments: { cmd: `touch ${marker}` } },
+    });
+    const tape = await writeTape(dir, [evilCall]);
+    const { io, lines } = captureIo();
+    expect(await main(["inspect", tape], io)).toBe(0);
+    expect(lines.join("\n")).toContain("touch");
+    expect(existsSync(marker)).toBe(false);
+  });
+
+  it("fails on missing tape path and unreadable files", async () => {
+    const { io, errors } = captureIo();
+    expect(await main(["inspect"], io)).toBe(2);
+    expect(await main(["inspect", "/nonexistent/nope.agentlog"], io)).toBe(1);
+    expect(errors.join("\n")).toContain("inspect");
+  });
+
+  it("fails on unknown inspect options", async () => {
+    const { io } = captureIo();
+    expect(await main(["inspect", "--bogus", "x"], io)).toBe(2);
+  });
 });

@@ -11,7 +11,7 @@ describe("ActionEnvelope", () => {
   it("constructs a valid envelope with defaults", () => {
     const envelope = createActionEnvelope({
       protocol: "mcp",
-      sessionId: "session-1",
+      recordingId: "recording-1",
       operation: "tools/call",
       target: "filesystem/read_file",
       arguments: { path: "/tmp/a.txt" },
@@ -28,7 +28,7 @@ describe("ActionEnvelope", () => {
   it("survives JSON.stringify -> JSON.parse without losing structure", () => {
     const envelope = createActionEnvelope({
       protocol: "mcp",
-      sessionId: "session-1",
+      recordingId: "recording-1",
       operation: "tools/call",
       target: "filesystem/read_file",
       arguments: { path: "/tmp/a.txt", options: { encoding: "utf8", retries: 2 } },
@@ -45,7 +45,7 @@ describe("ActionEnvelope", () => {
   it("represents a failed action via error", () => {
     const envelope = createActionEnvelope({
       protocol: "mcp",
-      sessionId: "session-1",
+      recordingId: "recording-1",
       operation: "tools/call",
       target: "filesystem/read_file",
       arguments: { path: "/missing" },
@@ -66,7 +66,7 @@ describe("ActionEnvelope", () => {
       isActionEnvelope({
         ...createActionEnvelope({
           protocol: "mcp",
-          sessionId: "s",
+          recordingId: "s",
           operation: "op",
           target: "t",
         }),
@@ -84,7 +84,7 @@ describe("ActionEnvelope", () => {
     const base = () =>
       createActionEnvelope({
         protocol: "mcp",
-        sessionId: "s",
+        recordingId: "s",
         operation: "op",
         target: "t",
       });
@@ -136,10 +136,37 @@ describe("ActionEnvelope", () => {
 
     const envelope = createActionEnvelope({
       protocol: "mcp",
-      sessionId: "s",
+      recordingId: "s",
       operation: "op",
       target: "t",
     });
     expect(isActionEnvelope({ ...envelope, arguments: cyclic })).toBe(false);
+  });
+
+  it("rejects envelopes carrying both result and error", () => {
+    const base = () =>
+      createActionEnvelope({
+        protocol: "mcp",
+        recordingId: "s",
+        operation: "op",
+        target: "t",
+      });
+
+    expect(isActionEnvelope({ ...base(), result: { ok: true } })).toBe(true);
+    expect(isActionEnvelope({ ...base(), error: { code: "E", message: "m" } })).toBe(true);
+    expect(isActionEnvelope(base())).toBe(true);
+    expect(
+      isActionEnvelope({ ...base(), result: { ok: true }, error: { code: "E", message: "m" } }),
+    ).toBe(false);
+    expect(() =>
+      createActionEnvelope({
+        protocol: "mcp",
+        recordingId: "s",
+        operation: "op",
+        target: "t",
+        result: { ok: true },
+        error: { code: "E", message: "m" },
+      }),
+    ).toThrow("both result and error");
   });
 });

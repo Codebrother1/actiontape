@@ -1,11 +1,11 @@
 import type { ActionEnvelope, JsonObject } from "./action-envelope.js";
 
 export const ACTION_TAPE_EVENT_TYPES = [
-  "session.started",
+  "recording.started",
   "action.requested",
   "action.completed",
   "action.failed",
-  "session.ended",
+  "recording.ended",
 ] as const;
 
 export type ActionTapeEventType = (typeof ACTION_TAPE_EVENT_TYPES)[number];
@@ -14,12 +14,12 @@ interface ActionTapeEventBase {
   id: string;
   type: ActionTapeEventType;
   timestamp: string;
-  sessionId: string;
+  recordingId: string;
   metadata?: JsonObject;
 }
 
-export interface SessionStartedEvent extends ActionTapeEventBase {
-  type: "session.started";
+export interface RecordingStartedEvent extends ActionTapeEventBase {
+  type: "recording.started";
   protocol: string;
 }
 
@@ -38,14 +38,14 @@ export interface ActionFailedEvent extends ActionTapeEventBase {
   envelope: ActionEnvelope;
 }
 
-export interface SessionEndedEvent extends ActionTapeEventBase {
-  type: "session.ended";
+export interface RecordingEndedEvent extends ActionTapeEventBase {
+  type: "recording.ended";
   reason?: string;
 }
 
 export type ActionTapeEvent =
-  | SessionStartedEvent
+  | RecordingStartedEvent
   | ActionRequestedEvent
   | ActionCompletedEvent
   | ActionFailedEvent
-  | SessionEndedEvent;
+  | RecordingEndedEvent;

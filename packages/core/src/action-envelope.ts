@@ -20,7 +20,7 @@ export interface ActionEnvelope {
   timestamp: string;
   protocol: string;
   direction: ActionDirection;
-  sessionId: string;
+  recordingId: string;
   operation: string;
   target: string;
   arguments: JsonObject;
@@ -31,7 +31,7 @@ export interface ActionEnvelope {
 
 export interface ActionEnvelopeInit {
   protocol: string;
-  sessionId: string;
+  recordingId: string;
   operation: string;
   target: string;
   id?: string;
@@ -44,13 +44,16 @@ export interface ActionEnvelopeInit {
 }
 
 export function createActionEnvelope(init: ActionEnvelopeInit): ActionEnvelope {
+  if (init.result !== undefined && init.error !== undefined) {
+    throw new Error("ActionEnvelope cannot carry both result and error");
+  }
   const envelope: ActionEnvelope = {
     schemaVersion: ACTION_ENVELOPE_SCHEMA_VERSION,
     id: init.id ?? randomUUID(),
     timestamp: init.timestamp ?? new Date().toISOString(),
     protocol: init.protocol,
     direction: init.direction ?? "outbound",
-    sessionId: init.sessionId,
+    recordingId: init.recordingId,
     operation: init.operation,
     target: init.target,
     arguments: init.arguments ?? {},
@@ -121,12 +124,13 @@ export function isActionEnvelope(value: unknown): value is ActionEnvelope {
     typeof value.timestamp === "string" &&
     typeof value.protocol === "string" &&
     (value.direction === "outbound" || value.direction === "inbound") &&
-    typeof value.sessionId === "string" &&
+    typeof value.recordingId === "string" &&
     typeof value.operation === "string" &&
     typeof value.target === "string" &&
     isJsonObject(value.arguments) &&
     (value.result === undefined || isJsonValue(value.result)) &&
     (value.error === undefined || isActionError(value.error)) &&
+    !(value.result !== undefined && value.error !== undefined) &&
     (value.metadata === undefined || isJsonObject(value.metadata))
   );
 }
