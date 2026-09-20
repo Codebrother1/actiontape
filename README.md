@@ -1,15 +1,19 @@
 # ActionTape
 
-A deterministic record/replay, contract-testing, behavior-diffing, and
-policy-simulation layer for AI agent tool calls. Initial protocol target:
-[Model Context Protocol (MCP)](https://modelcontextprotocol.io).
+ActionTape records and analyzes AI agent tool calls. Today it is a
+deterministic **recording, contract-testing, and historical authorization**
+layer for [Model Context Protocol (MCP)](https://modelcontextprotocol.io)
+stdio traffic: capture real sessions, normalize them into `ActionEnvelope`
+records, check them against declarative contracts, and ask what a candidate
+AuthZEN policy _would have decided_ — with evidence of which COAZ-MCP
+authorization mapping actually applied at each point in the recording.
 
-> **Status: early / experimental.** Working features today: transparent
-> **stdio recording** of MCP traffic, **read-only tape inspection**
-> (`inspect` / `inspect --json`), **deterministic contract checks** (`check`),
-> and **counterfactual AuthZEN simulation** (`authzen export` / `authzen
-simulate`). Replay, diffing, redaction, and runtime policy enforcement are
-> not implemented yet.
+> **Status: experimental v0.1.** Implemented today: transparent stdio
+> recording, read-only tape inspection (`inspect`), deterministic contract
+> checks (`check`), mapping-provenance analysis (`authzen plan`), historical
+> request rendering (`authzen render`), and counterfactual PDP evaluation
+> (`authzen simulate` / `authzen audit`). Replay, behavior diffing, redaction,
+> and runtime enforcement are not implemented yet.
 
 ## What problem is this trying to solve?
 
@@ -17,27 +21,39 @@ AI agents act on the world through tool calls. Those calls are
 non-deterministic at the edges — live services, clocks, random identifiers —
 which makes agent behavior hard to test, reproduce, and audit.
 
-ActionTape intends to sit between an agent and its tool servers:
+ActionTape sits between an agent and its tool servers:
 
 ```
 Agent
   |
   v
-ActionTape  (record / replay / inspect / diff / contract / policy simulation)
+ActionTape  (record / inspect / contract / mapping evidence / policy analysis)
   |
   v
 MCP servers / tools
 ```
 
-By capturing tool calls as immutable, serializable records, ActionTape aims to
-let developers:
+By capturing tool calls as immutable, serializable records, ActionTape lets
+developers:
 
-- record real agent sessions and replay them deterministically in CI
+- record real agent sessions for deterministic offline analysis
 - write contracts over tool-call sequences
-- diff agent behavior between runs, models, or prompts
-- simulate policy decisions against recorded traffic
+- analyze which authorization mapping provably applied to each recorded call
+- simulate or audit policy decisions against recorded traffic
 
-ActionTape is **not** an agent framework and has no LLM dependency in its core.
+Longer-term goals include deterministic replay and behavior diffing; neither
+is implemented today. ActionTape is **not** an agent framework and has no LLM
+dependency in its core.
+
+## Install
+
+After the first npm release (this repository is not yet published):
+
+```sh
+npm install -g actiontape
+```
+
+Until then, build from source — see [Development](#development).
 
 ## Recording MCP stdio traffic
 
@@ -320,6 +336,27 @@ the audit. ActionTape's recording path has also been smoke-tested with
 `@modelcontextprotocol/server-filesystem@2026.8.31` in a disposable sandbox —
 a compatibility smoke test, not a blanket claim of MCP-server compatibility.
 
+## Privacy and data handling
+
+`.agentlog` recordings capture MCP traffic **verbatim** and may contain
+sensitive data: tool arguments, tool results, error data, request metadata,
+application data, and credentials or personal information if the traffic
+itself contained them. **ActionTape does not provide automatic redaction** —
+protect recordings accordingly.
+
+Per-command behavior:
+
+- `record` starts/executes the configured MCP server process and records its
+  wire traffic
+- `inspect` and `check` read a recording only; no historical tool re-execution
+- `authzen plan` and `authzen render` read a recording and never contact a
+  PDP (`render --json` may contain historical/token-derived values a declared
+  mapping intentionally projects)
+- `authzen export` emits authorization requests without contacting a PDP
+- `authzen simulate` and `authzen audit` contact the **user-specified** PDP;
+  `audit` may transmit mapping-projected historical/token-derived data but
+  never contacts the historical MCP tools
+
 ## Packages
 
 - `@actiontape/core` — protocol-independent `ActionEnvelope` domain model and
@@ -333,8 +370,7 @@ a compatibility smoke test, not a blanket claim of MCP-server compatibility.
 - `@actiontape/authzen` — COAZ-MCP Draft 1 default `tools/call` mapping,
   declared-mapping CEL renderer, AuthZEN Access Evaluation(s) clients, and
   sequential simulation engine
-- `@actiontape/cli` — `actiontape` CLI (`record`, `inspect`, `check`,
-  `authzen`)
+- `actiontape` — the CLI (`record`, `inspect`, `check`, `authzen`)
 
 ## Development
 
