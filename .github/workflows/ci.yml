@@ -25,8 +25,8 @@ jobs:
       - run: pnpm install --frozen-lockfile
       - run: pnpm format:check
       - run: pnpm lint
-      - run: pnpm typecheck
       - run: pnpm build
+      - run: pnpm typecheck
       - run: pnpm test
       - name: packaging smoke (pack only, never publishes)
         run: pnpm -r exec pnpm pack --pack-destination "$RUNNER_TEMP"
