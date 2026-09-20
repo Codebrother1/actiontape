@@ -316,9 +316,9 @@ Exit codes: `0` = `pass` (everything evaluated and permitted), `1` = `deny`
 synthetic MCP recording against a real **Cerbos 0.55.0** PDP over the AuthZEN
 Access Evaluation **and** Access Evaluations (batch) endpoints, exercising
 both declared and confirmed-default mappings. Tools are never executed during
-the audit. ActionTape's recording path has also been smoke-tested against the
-official filesystem MCP server (`@modelcontextprotocol/server-filesystem`
-0.6.2).
+the audit. ActionTape's recording path has also been smoke-tested with
+`@modelcontextprotocol/server-filesystem@2026.8.31` in a disposable sandbox —
+a compatibility smoke test, not a blanket claim of MCP-server compatibility.
 
 ## Packages
 
