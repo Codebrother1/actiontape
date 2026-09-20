@@ -5,3 +5,5 @@ export * from "./tape-writer.js";
 export * from "./diagnostics.js";
 export * from "./tape-reader.js";
 export * from "./normalize.js";
+export * from "./catalog.js";
+export * from "./provenance.js";

@@ -725,4 +725,207 @@ describe("actiontape authzen", () => {
       await stopPdp();
     });
   });
+
+  describe("plan", () => {
+    async function writeDirTape(
+      dir: string,
+      msgs: [dir: "client_to_server" | "server_to_client", raw: unknown][],
+    ): Promise<string> {
+      const tapePath = join(dir, "tape.agentlog");
+      const lines = msgs.map(([direction, raw], i) =>
+        JSON.stringify(
+          createWireRecord({
+            recordingId: "rec-plan",
+            sequence: i,
+            direction,
+            raw: JSON.stringify(raw),
+          }),
+        ),
+      );
+      await writeFile(tapePath, lines.join("\n") + "\n", "utf8");
+      return tapePath;
+    }
+    const req = (id: number, method: string, params?: unknown) =>
+      ({ jsonrpc: "2.0", id, method, ...(params !== undefined ? { params } : {}) }) as const;
+    const res = (id: number, result: unknown) => ({ jsonrpc: "2.0", id, result }) as const;
+    const call = (id: number, name: string, args: Record<string, unknown> = {}) =>
+      req(id, "tools/call", { name, arguments: args });
+    const tool = (name: string, mapping?: unknown) => ({
+      name,
+      inputSchema: {
+        type: "object",
+        ...(mapping !== undefined ? { "x-authzen-mapping": mapping } : {}),
+      },
+    });
+
+    it("exit 0 when all actions have known provenance (declared + default)", async () => {
+      const dir = await mkdtemp(join(tmpdir(), "actiontape-plan-"));
+      const tape = await writeDirTape(dir, [
+        ["client_to_server", req(1, "tools/list")],
+        [
+          "server_to_client",
+          res(1, { tools: [tool("get_customer", { evaluation: "x" }), tool("get_weather")] }),
+        ],
+        ["client_to_server", call(2, "get_customer")],
+        ["server_to_client", res(2, {})],
+        ["client_to_server", call(3, "get_weather")],
+        ["server_to_client", res(3, {})],
+      ]);
+      const { io, lines } = captureIo();
+      expect(await main(["authzen", "plan", tape], io)).toBe(0);
+      const out = lines.join("\n");
+      expect(out).toContain("declared: 1");
+      expect(out).toContain("default-confirmed: 1");
+      expect(out).toContain("DECLARED get_customer");
+      expect(out).toContain("DEFAULT  get_weather");
+      expect(out).not.toContain("evaluation");
+    });
+
+    it("exit 1 with unknown provenance when no catalog exists", async () => {
+      const dir = await mkdtemp(join(tmpdir(), "actiontape-plan-"));
+      const tape = await writeDirTape(dir, [
+        ["client_to_server", call(1, "mystery", { evil: "$(touch /tmp/x)" })],
+        ["server_to_client", res(1, {})],
+      ]);
+      const { io, lines } = captureIo();
+      expect(await main(["authzen", "plan", tape], io)).toBe(1);
+      const out = lines.join("\n");
+      expect(out).toContain("unknown: 1");
+      expect(out).toContain("no completed catalog");
+      expect(out).not.toContain("/tmp/x");
+    });
+
+    it("exit 1 when catalog was invalidated before the call", async () => {
+      const dir = await mkdtemp(join(tmpdir(), "actiontape-plan-"));
+      const tape = await writeDirTape(dir, [
+        ["client_to_server", req(1, "tools/list")],
+        ["server_to_client", res(1, { tools: [tool("a")] })],
+        ["server_to_client", req(0, "notifications/tools/list_changed")],
+        ["client_to_server", call(2, "a")],
+        ["server_to_client", res(2, {})],
+      ]);
+      const { io, lines } = captureIo();
+      expect(await main(["authzen", "plan", tape], io)).toBe(1);
+      expect(lines.join("\n")).toContain("invalidated");
+    });
+
+    it("resolves a tool from the second page of a paginated catalog", async () => {
+      const dir = await mkdtemp(join(tmpdir(), "actiontape-plan-"));
+      const tape = await writeDirTape(dir, [
+        ["client_to_server", req(1, "tools/list")],
+        ["server_to_client", res(1, { tools: [tool("a")], nextCursor: "c1" })],
+        ["client_to_server", req(2, "tools/list", { cursor: "c1" })],
+        ["server_to_client", res(2, { tools: [tool("deep_tool")] })],
+        ["client_to_server", call(3, "deep_tool")],
+        ["server_to_client", res(3, {})],
+      ]);
+      const { io, lines } = captureIo();
+      expect(await main(["authzen", "plan", tape], io)).toBe(0);
+      expect(lines.join("\n")).toContain("DEFAULT  deep_tool");
+    });
+
+    it("exit 2 on normalization diagnostics, with clean --json error object", async () => {
+      const dir = await mkdtemp(join(tmpdir(), "actiontape-plan-"));
+      const tapePath = join(dir, "tape.agentlog");
+      await writeFile(tapePath, "garbage\n", "utf8");
+      const out = sink();
+      const { io, errors } = captureIo();
+      expect(await main(["authzen", "plan", "--json", tapePath], { ...io, out: out.stream })).toBe(
+        2,
+      );
+      const parsed = JSON.parse(out.text()) as Record<string, unknown>;
+      expect(out.text().trim().split("\n")).toHaveLength(1);
+      expect(parsed.status).toBe("error");
+      expect(errors.join("\n")).toContain("malformed_jsonl");
+      expect(errors.join("\n")).not.toMatch(/\n\s+at /);
+    });
+
+    it("--json emits exactly one object for complete and incomplete plans", async () => {
+      const dir = await mkdtemp(join(tmpdir(), "actiontape-plan-"));
+      const complete = await writeDirTape(dir, [
+        ["client_to_server", req(1, "tools/list")],
+        ["server_to_client", res(1, { tools: [tool("t", { evaluation: "e" })] })],
+        ["client_to_server", call(2, "t")],
+        ["server_to_client", res(2, {})],
+      ]);
+      const incomplete = await (async () => {
+        const p = join(dir, "tape2.agentlog");
+        const lines = [
+          JSON.stringify(
+            createWireRecord({
+              recordingId: "rec-plan",
+              sequence: 0,
+              direction: "client_to_server",
+              raw: JSON.stringify(call(1, "t")),
+            }),
+          ),
+          JSON.stringify(
+            createWireRecord({
+              recordingId: "rec-plan",
+              sequence: 1,
+              direction: "server_to_client",
+              raw: JSON.stringify(res(1, {})),
+            }),
+          ),
+        ];
+        await writeFile(p, lines.join("\n") + "\n", "utf8");
+        return p;
+      })();
+
+      const runJson = async (tape: string) => {
+        const out = sink();
+        const { io } = captureIo();
+        const code = await main(["authzen", "plan", "--json", tape], { ...io, out: out.stream });
+        const text = out.text();
+        expect(text.trim().split("\n")).toHaveLength(1);
+        return { code, parsed: JSON.parse(text) as Record<string, unknown> };
+      };
+
+      const c = await runJson(complete);
+      expect(c.code).toBe(0);
+      expect(c.parsed.status).toBe("complete");
+      expect((c.parsed.actions as { declaredMapping: unknown }[])[0]!.declaredMapping).toEqual({
+        evaluation: "e",
+      });
+
+      const i = await runJson(incomplete);
+      expect(i.code).toBe(1);
+      expect(i.parsed.status).toBe("incomplete");
+      expect(i.parsed.unknownCount).toBe(1);
+    });
+
+    it("treats suspicious mapping content as inert data", async () => {
+      const dir = await mkdtemp(join(tmpdir(), "actiontape-plan-"));
+      const marker = join(dir, "never-created");
+      const tape = await writeDirTape(dir, [
+        ["client_to_server", req(1, "tools/list")],
+        [
+          "server_to_client",
+          res(1, { tools: [tool("t", { eval: `$(touch ${marker})`, fn: "function(){}" })] }),
+        ],
+        ["client_to_server", call(2, "t")],
+        ["server_to_client", res(2, {})],
+      ]);
+      const out = sink();
+      const { io } = captureIo();
+      expect(await main(["authzen", "plan", "--json", tape], { ...io, out: out.stream })).toBe(0);
+      expect(existsSync(marker)).toBe(false);
+      // human output never dumps the mapping body
+      const { io: io2, lines: lines2 } = captureIo();
+      await main(["authzen", "plan", tape], io2);
+      expect(lines2.join("\n")).not.toContain("touch");
+      expect(out.text()).toContain("touch"); // json may carry the raw mapping as data
+    });
+
+    it("exit 0 with zero counts when the tape has no tool calls", async () => {
+      const dir = await mkdtemp(join(tmpdir(), "actiontape-plan-"));
+      const tape = await writeDirTape(dir, [
+        ["client_to_server", req(1, "tools/list")],
+        ["server_to_client", res(1, { tools: [tool("a")] })],
+      ]);
+      const { io, lines } = captureIo();
+      expect(await main(["authzen", "plan", tape], io)).toBe(0);
+      expect(lines.join("\n")).toContain("actions: 0");
+    });
+  });
 });

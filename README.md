@@ -151,6 +151,10 @@ This is **historical simulation**: it replays nothing, executes no tools, and
 enforces no live traffic.
 
 ```sh
+# Inspect recorded tools/list evidence for declared x-authzen-mapping provenance
+actiontape authzen plan ./my-run.agentlog
+actiontape authzen plan --json ./my-run.agentlog
+
 # Emit one Access Evaluation request per action (JSONL on stdout)
 actiontape authzen export ./my-run.agentlog \
   --subject-id alice@example.com --agent-id my-agent
@@ -180,6 +184,27 @@ the run (bad tape/diagnostics, mapping error, unreachable/misbehaving PDP).
 `--json` emits exactly one object: `{status: "pass"|"deny"|"error", ...}`.
 `export` exits `0` on success or `2` on error. Each MRTR wire round is a
 separate evaluation, matching normalization.
+
+### Mapping provenance (`authzen plan`)
+
+`plan` never contacts a PDP. It correlates recorded `tools/list` traffic —
+including paginated listings and `notifications/tools/list_changed`
+invalidation — and reports, per `tools/call` action:
+
+- **DECLARED** — a complete catalog captured before the call advertised
+  `x-authzen-mapping` in the tool's `inputSchema` (the raw mapping is preserved
+  as inert JSON evidence in `--json` output; it is never evaluated)
+- **DEFAULT_CONFIRMED** — a complete catalog advertised the tool with no
+  declared mapping, so the default `tools/call` mapping provably applied
+- **UNKNOWN** — insufficient evidence: no completed catalog before the call,
+  a catalog invalidated by `tools/list_changed` without refresh, incomplete
+  pagination (partial catalogs never prove a mapping's absence), the tool
+  missing from the catalog, or a malformed mapping
+
+Exit codes: `0` all actions known, `1` one or more UNKNOWN, `2` analysis could
+not safely run. `export`/`simulate` still always use the explicit default
+mapping — use `plan` to see whether a recorded tool declared one. CEL and
+`x-authzen-mapping` evaluation are not implemented yet.
 
 ## Packages
 

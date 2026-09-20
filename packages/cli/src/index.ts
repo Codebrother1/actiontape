@@ -21,10 +21,13 @@ import {
   type AuthzenSimulationDecision,
 } from "@actiontape/authzen";
 import {
+  extractMcpToolCatalogs,
   JsonlTapeWriter,
   normalizeMcpTape,
   readTapeFile,
+  resolveToolMappingProvenance,
   runStdioProxy,
+  type McpMappingUnknownReason,
   type NormalizationDiagnostic,
   type TapeEntry,
 } from "@actiontape/mcp";
@@ -62,8 +65,12 @@ exit codes: 0 = contract passed, 1 = violations found, 2 = evaluation error`;
 const AUTHZEN_USAGE = `usage:
   actiontape authzen export <tape> --subject-id <id> [--agent-id <id>]
   actiontape authzen simulate [--json] <tape> --endpoint <url> --subject-id <id> [--agent-id <id>] [--timeout-ms <ms>]
+  actiontape authzen plan [--json] <tape>
 
-exit codes: 0 = all permitted (export: success), 1 = one or more denied, 2 = operational error`;
+export/simulate use the COAZ-MCP Draft 1 default tools/call mapping.
+plan inspects recorded tools/list evidence for declared x-authzen-mapping provenance.
+
+exit codes: 0 = all permitted / provenance complete, 1 = denied / unknown provenance, 2 = operational error`;
 
 const RESPONSE_KIND_LABELS: Record<string, string> = {
   success: "success",
@@ -147,7 +154,12 @@ async function runRecord(
   }
 }
 
-function formatDiagnostic(d: NormalizationDiagnostic): string {
+function formatDiagnostic(d: {
+  code: string;
+  message: string;
+  line?: number;
+  sequence?: number;
+}): string {
   const where = [
     d.line !== undefined ? `line ${d.line}` : undefined,
     d.sequence !== undefined ? `seq ${d.sequence}` : undefined,
@@ -427,11 +439,9 @@ function parseAuthzenArgs(argv: string[]): AuthzenFlags | { error: string } {
   return flags;
 }
 
-async function loadTapeActions(
+async function loadTapeEntries(
   path: string,
-): Promise<
-  { actions: ActionEnvelope[]; diagnostics: NormalizationDiagnostic[] } | { error: string }
-> {
+): Promise<{ entries: TapeEntry[] } | { error: string }> {
   const entries: TapeEntry[] = [];
   try {
     for await (const entry of readTapeFile(path)) {
@@ -440,7 +450,17 @@ async function loadTapeActions(
   } catch (err) {
     return { error: err instanceof Error ? err.message : String(err) };
   }
-  return normalizeMcpTape(entries);
+  return { entries };
+}
+
+async function loadTapeActions(
+  path: string,
+): Promise<
+  { actions: ActionEnvelope[]; diagnostics: NormalizationDiagnostic[] } | { error: string }
+> {
+  const loaded = await loadTapeEntries(path);
+  if ("error" in loaded) return loaded;
+  return normalizeMcpTape(loaded.entries);
 }
 
 function checkAuthzenFlags(
@@ -464,7 +484,7 @@ function checkAuthzenFlags(
 }
 
 function reportDiagnostics(
-  diagnostics: NormalizationDiagnostic[],
+  diagnostics: { code: string; message: string; line?: number; sequence?: number }[],
   error: (line: string) => void,
 ): void {
   for (const d of diagnostics) {
@@ -634,6 +654,163 @@ async function runAuthzenSimulate(
   return exitCode;
 }
 
+const UNKNOWN_REASON_LABELS: Record<McpMappingUnknownReason, string> = {
+  no_catalog: "no completed catalog before call",
+  catalog_stale: "catalog invalidated by tools/list_changed",
+  partial_catalog: "catalog pagination incomplete",
+  tool_not_in_catalog: "tool absent from observed catalog",
+  malformed_mapping: "malformed x-authzen-mapping",
+};
+
+interface PlanResult {
+  schemaVersion: "1.0";
+  status: "complete" | "incomplete" | "error";
+  actionCount: number;
+  declaredCount: number;
+  defaultConfirmedCount: number;
+  unknownCount: number;
+  actions: {
+    actionId: string;
+    target: string;
+    mappingSource: "declared" | "default_confirmed" | "unknown";
+    reason: string | null;
+    catalogSequence: number | null;
+    declaredMapping: unknown;
+  }[];
+  catalogs: {
+    completedAtSequence: number;
+    pageCount: number;
+    toolCount: number;
+    invalidatedAtSequence: number | null;
+  }[];
+  diagnostics: { code: string; message: string; line?: number; sequence?: number }[];
+  error: string | null;
+}
+
+async function runAuthzenPlan(
+  argv: string[],
+  io: CliIo,
+  log: (line: string) => void,
+  error: (line: string) => void,
+): Promise<number> {
+  let json = false;
+  let path: string | undefined;
+  for (const arg of argv) {
+    if (arg === "--json") {
+      json = true;
+    } else if (arg === "--help" || arg === "-h") {
+      log(AUTHZEN_USAGE);
+      return 0;
+    } else if (arg.startsWith("-")) {
+      error(`actiontape authzen plan: unknown option ${arg}`);
+      error(AUTHZEN_USAGE);
+      return 2;
+    } else if (path === undefined) {
+      path = arg;
+    } else {
+      error(`actiontape authzen plan: unexpected argument ${arg}`);
+      error(AUTHZEN_USAGE);
+      return 2;
+    }
+  }
+  if (path === undefined) {
+    error("actiontape authzen plan: missing tape path");
+    error(AUTHZEN_USAGE);
+    return 2;
+  }
+
+  const result: PlanResult = {
+    schemaVersion: "1.0",
+    status: "error",
+    actionCount: 0,
+    declaredCount: 0,
+    defaultConfirmedCount: 0,
+    unknownCount: 0,
+    actions: [],
+    catalogs: [],
+    diagnostics: [],
+    error: null,
+  };
+  const finish = (exitCode: number): number => {
+    if (json) {
+      const out = io.out ?? process.stdout;
+      out.write(JSON.stringify(result) + "\n");
+    }
+    return exitCode;
+  };
+  const fail = (message: string): number => {
+    result.error = message;
+    error(`actiontape authzen plan: ${message}`);
+    return finish(2);
+  };
+
+  const loaded = await loadTapeEntries(path);
+  if ("error" in loaded) return fail(loaded.error);
+
+  const { actions, diagnostics } = normalizeMcpTape(loaded.entries);
+  const timeline = extractMcpToolCatalogs(loaded.entries);
+  result.actionCount = actions.length;
+  result.catalogs = timeline.catalogs.map((c) => ({
+    completedAtSequence: c.completedAtSequence,
+    pageCount: c.pageCount,
+    toolCount: c.tools.length,
+    invalidatedAtSequence: c.invalidatedAtSequence ?? null,
+  }));
+  result.diagnostics = [...diagnostics, ...timeline.diagnostics];
+  reportDiagnostics(timeline.diagnostics, error);
+
+  if (diagnostics.length > 0) {
+    reportDiagnostics(diagnostics, error);
+    return fail(`tape produced ${diagnostics.length} normalization diagnostic(s)`);
+  }
+
+  try {
+    for (const action of actions) {
+      const p = resolveToolMappingProvenance(action, timeline);
+      result.actions.push({
+        actionId: p.actionId,
+        target: p.toolName,
+        mappingSource: p.mappingSource,
+        reason: p.reason,
+        catalogSequence: p.catalogSequence,
+        declaredMapping: p.declaredMapping,
+      });
+    }
+  } catch (err) {
+    return fail(err instanceof Error ? err.message : String(err));
+  }
+
+  result.declaredCount = result.actions.filter((a) => a.mappingSource === "declared").length;
+  result.defaultConfirmedCount = result.actions.filter(
+    (a) => a.mappingSource === "default_confirmed",
+  ).length;
+  result.unknownCount = result.actions.filter((a) => a.mappingSource === "unknown").length;
+  result.status = result.unknownCount === 0 ? "complete" : "incomplete";
+  const exitCode = result.status === "complete" ? 0 : 1;
+  if (json) return finish(exitCode);
+
+  log("AUTHZEN PLAN");
+  log(`actions: ${result.actionCount}`);
+  log(`declared: ${result.declaredCount}`);
+  log(`default-confirmed: ${result.defaultConfirmedCount}`);
+  log(`unknown: ${result.unknownCount}`);
+  log("");
+  for (const a of result.actions) {
+    const detail =
+      a.mappingSource === "unknown"
+        ? UNKNOWN_REASON_LABELS[a.reason as McpMappingUnknownReason]
+        : `catalog seq ${a.catalogSequence}`;
+    const label =
+      a.mappingSource === "declared"
+        ? "DECLARED"
+        : a.mappingSource === "default_confirmed"
+          ? "DEFAULT "
+          : "UNKNOWN ";
+    log(`${label} ${a.target} (${a.actionId}) — ${detail}`);
+  }
+  return exitCode;
+}
+
 async function runAuthzen(
   argv: string[],
   io: CliIo,
@@ -642,6 +819,7 @@ async function runAuthzen(
 ): Promise<number> {
   if (argv[0] === "export") return runAuthzenExport(argv.slice(1), io, log, error);
   if (argv[0] === "simulate") return runAuthzenSimulate(argv.slice(1), io, log, error);
+  if (argv[0] === "plan") return runAuthzenPlan(argv.slice(1), io, log, error);
   error(`actiontape authzen: expected "export" or "simulate"`);
   error(AUTHZEN_USAGE);
   return 2;
