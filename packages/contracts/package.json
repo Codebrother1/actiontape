@@ -1,7 +1,17 @@
 {
   "name": "@actiontape/contracts",
   "version": "0.1.0",
+  "description": "Deterministic action contract evaluation for ActionTape.",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Codebrother1/actiontape.git",
+    "directory": "packages/contracts"
+  },
+  "homepage": "https://github.com/Codebrother1/actiontape#readme",
+  "bugs": {
+    "url": "https://github.com/Codebrother1/actiontape/issues"
+  },
   "type": "module",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",

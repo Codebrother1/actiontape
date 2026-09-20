@@ -42,7 +42,7 @@ import type { JsonObject } from "@actiontape/core";
 
 export const CLI_VERSION = "0.1.0";
 
-const HELP = `actiontape - deterministic record/replay for agent tool calls
+const HELP = `actiontape - record agent tool calls and audit historical authorization
 
 Usage:
   actiontape record --out <path> -- <command> [args...]   Record MCP stdio traffic to a JSONL tape

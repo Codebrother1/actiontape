@@ -47,7 +47,7 @@ dependency in its core.
 
 ## Install
 
-After the first npm release (this repository is not yet published):
+After the first npm release (the npm packages are not yet published):
 
 ```sh
 npm install -g actiontape

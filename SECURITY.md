@@ -8,13 +8,12 @@ unsupported.
 
 Please do **not** file security-sensitive reports as public issues.
 
-A private vulnerability-reporting destination has not been activated yet.
-Once the public repository exists, reporters should use GitHub's private
-security advisory mechanism (Security → "Report a vulnerability") if enabled.
+Report vulnerabilities privately through GitHub's private vulnerability
+reporting for this repository:
 
-> **Release task:** the private reporting destination must be activated
-> before the public release. This file intentionally contains no contact
-> address yet — do not treat it as complete until then.
+https://github.com/Codebrother1/actiontape/security/advisories/new
+
+(Security → "Report a vulnerability".)
 
 ## Scope notes
 
