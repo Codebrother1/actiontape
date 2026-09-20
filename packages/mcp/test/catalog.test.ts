@@ -96,10 +96,12 @@ describe("extractMcpToolCatalogs", () => {
     expect(r.catalogs[1]!.tools[0]!.name).toBe("num");
   });
 
-  it("diagnoses unmatched list responses, missing responses, and error responses", () => {
+  it("ignores orphan responses even when the result advertises a tools array", () => {
+    // A JSON-RPC response does not identify its method; shape alone must never
+    // create catalog evidence or a catalog diagnostic.
     reset();
     const orphan = extractMcpToolCatalogs([listRes(9, { tools: [tool("x")] })]);
-    expect(orphan.diagnostics.map((d) => d.code)).toEqual(["unmatched_list_response"]);
+    expect(orphan.diagnostics).toEqual([]);
     expect(orphan.catalogs).toEqual([]);
 
     reset();
@@ -110,6 +112,20 @@ describe("extractMcpToolCatalogs", () => {
     const failed = extractMcpToolCatalogs([listReq(1), listErr(1)]);
     expect(failed.diagnostics.map((d) => d.code)).toEqual(["list_error"]);
     expect(failed.catalogs).toEqual([]);
+  });
+
+  it("never treats a tools/call or other response containing a tools member as catalog data", () => {
+    reset();
+    const callReq = c2s({
+      jsonrpc: "2.0",
+      id: 5,
+      method: "tools/call",
+      params: { name: "t", arguments: {} },
+    });
+    const callRes = listRes(5, { tools: [tool("should_not_be_catalog")] });
+    const r = extractMcpToolCatalogs([callReq, callRes]);
+    expect(r.catalogs).toEqual([]);
+    expect(r.diagnostics).toEqual([]);
   });
 
   it("diagnoses malformed results, tools, mappings, and duplicate names", () => {
@@ -225,6 +241,44 @@ describe("pagination", () => {
     ]);
     expect(loop.diagnostics.map((d) => d.code)).toContain("cursor_reuse");
     expect(loop.catalogs).toEqual([]);
+  });
+
+  it("interleaves independent chains with distinct cursors correctly", () => {
+    reset();
+    const t = [
+      listReq(1),
+      listRes(1, { tools: [tool("A1")], nextCursor: "cursor-a" }),
+      listReq(2),
+      listRes(2, { tools: [tool("B1")], nextCursor: "cursor-b" }),
+      listReq(3, "cursor-b"),
+      listRes(3, { tools: [tool("B2")] }),
+      listReq(4, "cursor-a"),
+      listRes(4, { tools: [tool("A2")] }),
+    ];
+    const r = extractMcpToolCatalogs(t);
+    expect(r.diagnostics).toEqual([]);
+    expect(r.catalogs).toHaveLength(2);
+    // Snapshots are ordered by completion sequence: chain B completes first.
+    const byFirstTool = Object.fromEntries(
+      r.catalogs.map((c) => [c.tools[0]!.name, c.tools.map((x) => x.name)]),
+    );
+    expect(byFirstTool).toEqual({ B1: ["B1", "B2"], A1: ["A1", "A2"] });
+  });
+
+  it("refuses to disambiguate a continuation shared by two open chains", () => {
+    reset();
+    const t = [
+      listReq(1),
+      listRes(1, { tools: [tool("A1")], nextCursor: "collision" }),
+      listReq(2),
+      listRes(2, { tools: [tool("B1")], nextCursor: "collision" }),
+      listReq(3, "collision"),
+      listRes(3, { tools: [tool("X")] }),
+    ];
+    const r = extractMcpToolCatalogs(t);
+    expect(r.diagnostics.map((d) => d.code)).toContain("ambiguous_cursor");
+    expect(r.catalogs).toEqual([]);
+    expect(r.incomplete).toHaveLength(2);
   });
 
   it("diagnoses duplicate tool names across pages", () => {

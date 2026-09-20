@@ -200,6 +200,24 @@ describe("resolveToolMappingProvenance", () => {
     expect(timeline.catalogs).toHaveLength(1);
   });
 
+  it("ambiguous pagination never produces DECLARED or DEFAULT_CONFIRMED", () => {
+    reset();
+    const { provenance } = analyze([
+      listReq(1),
+      listRes(1, { tools: [tool("a", MAPPING)], nextCursor: "collision" }),
+      listReq(2),
+      listRes(2, { tools: [tool("b")], nextCursor: "collision" }),
+      listReq(3, "collision"),
+      listRes(3, { tools: [tool("c")] }),
+      callReq(4, "a"),
+      callRes(4),
+    ]);
+    // Central safety property: ambiguity must resolve to UNKNOWN, never to a
+    // guessed declared/default provenance.
+    expect(provenance[0]!.mappingSource).toBe("unknown");
+    expect(provenance[0]!.reason).toBe("partial_catalog");
+  });
+
   it("rejects non-tools/call or non-mcp envelopes", () => {
     reset();
     const { actions } = normalizeMcpTape([callReq(1, "t"), callRes(1)]);

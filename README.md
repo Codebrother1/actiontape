@@ -199,7 +199,9 @@ invalidation — and reports, per `tools/call` action:
 - **UNKNOWN** — insufficient evidence: no completed catalog before the call,
   a catalog invalidated by `tools/list_changed` without refresh, incomplete
   pagination (partial catalogs never prove a mapping's absence), the tool
-  missing from the catalog, or a malformed mapping
+  missing from the catalog, or a malformed mapping. A continuation cursor
+  shared by multiple open listings is ambiguous — ActionTape never guesses
+  which catalog it continues, so the affected listings stay incomplete.
 
 Exit codes: `0` all actions known, `1` one or more UNKNOWN, `2` analysis could
 not safely run. `export`/`simulate` still always use the explicit default

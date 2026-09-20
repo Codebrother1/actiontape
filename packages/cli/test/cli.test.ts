@@ -917,6 +917,29 @@ describe("actiontape authzen", () => {
       expect(out.text()).toContain("touch"); // json may carry the raw mapping as data
     });
 
+    it("ambiguous pagination yields UNKNOWN, never declared/default", async () => {
+      const dir = await mkdtemp(join(tmpdir(), "actiontape-plan-"));
+      const tape = await writeDirTape(dir, [
+        ["client_to_server", req(1, "tools/list")],
+        ["server_to_client", res(1, { tools: [tool("a")], nextCursor: "collision" })],
+        ["client_to_server", req(2, "tools/list")],
+        ["server_to_client", res(2, { tools: [tool("b")], nextCursor: "collision" })],
+        ["client_to_server", req(3, "tools/list", { cursor: "collision" })],
+        ["server_to_client", res(3, { tools: [tool("c")] })],
+        ["client_to_server", call(4, "a")],
+        ["server_to_client", res(4, {})],
+      ]);
+      const out = sink();
+      const { io } = captureIo();
+      // Ambiguity is evidence-insufficiency, not an operational failure.
+      const code = await main(["authzen", "plan", "--json", tape], { ...io, out: out.stream });
+      expect(code).toBe(1);
+      const parsed = JSON.parse(out.text()) as Record<string, unknown>;
+      expect(out.text().trim().split("\n")).toHaveLength(1);
+      expect(parsed.status).toBe("incomplete");
+      expect((parsed.actions as { mappingSource: string }[])[0]!.mappingSource).toBe("unknown");
+    });
+
     it("exit 0 with zero counts when the tape has no tool calls", async () => {
       const dir = await mkdtemp(join(tmpdir(), "actiontape-plan-"));
       const tape = await writeDirTape(dir, [

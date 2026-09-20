@@ -32,7 +32,7 @@ export interface McpIncompleteCatalogEvidence {
 export type McpCatalogDiagnosticCode =
   | "invalid_list_request"
   | "duplicate_list_request_id"
-  | "unmatched_list_response"
+  | "ambiguous_cursor"
   | "incomplete_list_request"
   | "list_error"
   | "malformed_list_result"
@@ -253,19 +253,12 @@ export function extractMcpToolCatalogs(entries: Iterable<TapeEntry>): McpCatalog
       if (!isResponse || !isRequestId(msg.id)) continue;
       const key = requestIdKey(msg.id);
       const req = pending.get(key);
-      if (!req) {
-        // A response that advertises a tools array with no pending list
-        // request is an orphaned catalog page — diagnose it.
-        if (isJsonObject(msg.result) && Array.isArray(msg.result.tools)) {
-          diagnose({
-            code: "unmatched_list_response",
-            message: `line ${entry.line}: tools/list response id ${JSON.stringify(msg.id)} has no pending request`,
-            line: entry.line,
-            sequence: record.sequence,
-          });
-        }
-        continue;
-      }
+      // A JSON-RPC response does not identify its originating method, so a
+      // response is catalog evidence ONLY when its id correlates to a known
+      // outstanding tools/list request. Orphaned responses — including ones
+      // whose result happens to contain a "tools" member — are left outside
+      // the extractor's knowledge; the normalizer diagnoses them separately.
+      if (!req) continue;
       pending.delete(key);
       if (msg.error !== undefined) {
         diagnose({
@@ -343,8 +336,11 @@ export function extractMcpToolCatalogs(entries: Iterable<TapeEntry>): McpCatalog
       };
       openChains.push(chain);
     } else {
-      const target = openChains.find((c) => !c.dead && c.nextCursor === cursor);
-      if (!target) {
+      // Cursors are opaque: a continuation can only extend an open chain when
+      // exactly one chain awaits that cursor. Multiple matches mean the tape
+      // cannot tell which listing this request continues — refuse to guess.
+      const targets = openChains.filter((c) => !c.dead && c.nextCursor === cursor);
+      if (targets.length === 0) {
         diagnose({
           code: "cursor_mismatch",
           message: `line ${entry.line}: tools/list continuation cursor ${JSON.stringify(cursor)} matches no open catalog`,
@@ -352,8 +348,22 @@ export function extractMcpToolCatalogs(entries: Iterable<TapeEntry>): McpCatalog
           sequence: record.sequence,
         });
         chain = null;
+      } else if (targets.length > 1) {
+        diagnose({
+          code: "ambiguous_cursor",
+          message:
+            `line ${entry.line}: tools/list continuation cursor ${JSON.stringify(cursor)} ` +
+            `matches ${targets.length} open catalogs (started at sequences ` +
+            `${targets.map((c) => c.requestSequence).join(", ")})`,
+          line: entry.line,
+          sequence: record.sequence,
+        });
+        // Neither chain can ever be safely continued; retire both as
+        // incomplete so they can never produce catalog evidence.
+        for (const t of targets) killChain(t);
+        chain = null;
       } else {
-        chain = target;
+        chain = targets[0]!;
       }
     }
     pending.set(key, { sequence: record.sequence, line: entry.line, chain });
