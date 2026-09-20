@@ -1,0 +1,17 @@
+apiVersion: api.cerbos.dev/v1
+resourcePolicy:
+  version: "default"
+  resource: "customer"
+  rules:
+    # Declared x-authzen-mapping projects the recorded MCP tool argument
+    # into the AuthZEN resource id, so the policy can distinguish
+    # cust-public from cust-sensitive even though both calls invoked the
+    # same MCP tool.
+    - actions:
+        - "get_customer"
+      effect: EFFECT_ALLOW
+      roles:
+        - "*"
+      condition:
+        match:
+          expr: R.id != "cust-sensitive"

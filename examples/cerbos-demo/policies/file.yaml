@@ -1,0 +1,13 @@
+apiVersion: api.cerbos.dev/v1
+resourcePolicy:
+  version: "default"
+  resource: "file"
+  rules:
+    # Drives the multi-decision demo: a single recorded copy_file call
+    # renders an AuthZEN "evaluations" envelope (READ source + WRITE
+    # destination). Read is allowed; write has no rule and is denied.
+    - actions:
+        - "read"
+      effect: EFFECT_ALLOW
+      roles:
+        - "*"

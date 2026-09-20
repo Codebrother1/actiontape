@@ -310,6 +310,18 @@ Exit codes: `0` = `pass` (everything evaluated and permitted), `1` = `deny`
 `authzen simulate` remains the Milestone-4 explicit default-mapping simulator;
 `authzen audit` is the historical evidence-aware declared/default audit.
 
+### Real PDP demo
+
+[`examples/cerbos-demo/`](examples/cerbos-demo/README.md) audits a committed
+synthetic MCP recording against a real **Cerbos 0.55.0** PDP over the AuthZEN
+Access Evaluation **and** Access Evaluations (batch) endpoints, exercising
+both declared and confirmed-default mappings. Tools are never executed during
+the audit. ActionTape's recording path has also been smoke-tested against the
+official filesystem MCP server (`@modelcontextprotocol/server-filesystem`
+0.6.2).
+
+## Packages
+
 - `@actiontape/core` — protocol-independent `ActionEnvelope` domain model and
   a small event vocabulary (`recording.started`, `action.requested`,
   `action.completed`, `action.failed`, `recording.ended`)
