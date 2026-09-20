@@ -36,7 +36,7 @@ importers:
   packages/authzen:
     dependencies:
       '@actiontape/core':
-        specifier: workspace:*
+        specifier: workspace:^
         version: link:../core
       '@marcbachmann/cel-js':
         specifier: 8.0.0
@@ -45,25 +45,25 @@ importers:
   packages/cli:
     dependencies:
       '@actiontape/authzen':
-        specifier: workspace:*
+        specifier: workspace:^
         version: link:../authzen
       '@actiontape/contracts':
-        specifier: workspace:*
+        specifier: workspace:^
         version: link:../contracts
       '@actiontape/core':
-        specifier: workspace:*
+        specifier: workspace:^
         version: link:../core
       '@actiontape/mcp':
-        specifier: workspace:*
+        specifier: workspace:^
         version: link:../mcp
       '@actiontape/recorder':
-        specifier: workspace:*
+        specifier: workspace:^
         version: link:../recorder
 
   packages/contracts:
     dependencies:
       '@actiontape/core':
-        specifier: workspace:*
+        specifier: workspace:^
         version: link:../core
       yaml:
         specifier: ^2.9.1
@@ -74,13 +74,13 @@ importers:
   packages/mcp:
     dependencies:
       '@actiontape/core':
-        specifier: workspace:*
+        specifier: workspace:^
         version: link:../core
 
   packages/recorder:
     dependencies:
       '@actiontape/core':
-        specifier: workspace:*
+        specifier: workspace:^
         version: link:../core
 
 packages:

@@ -1,7 +1,8 @@
 {
-  "name": "actiontape",
-  "version": "0.0.0",
+  "name": "actiontape-workspace",
+  "version": "0.1.0",
   "private": true,
+  "license": "MIT",
   "type": "module",
   "packageManager": "pnpm@11.11.0",
   "engines": {

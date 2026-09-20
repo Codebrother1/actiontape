@@ -1,7 +1,7 @@
 {
-  "name": "@actiontape/cli",
-  "version": "0.0.0",
-  "private": true,
+  "name": "actiontape",
+  "version": "0.1.0",
+  "license": "MIT",
   "type": "module",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
@@ -17,16 +17,23 @@
   "files": [
     "dist"
   ],
+  "engines": {
+    "node": ">=22"
+  },
   "scripts": {
     "build": "tsc -p tsconfig.build.json",
     "typecheck": "tsc -p tsconfig.json",
-    "test": "vitest run"
+    "test": "vitest run",
+    "prepack": "pnpm -w build"
+  },
+  "publishConfig": {
+    "access": "public"
   },
   "dependencies": {
-    "@actiontape/authzen": "workspace:*",
-    "@actiontape/core": "workspace:*",
-    "@actiontape/recorder": "workspace:*",
-    "@actiontape/contracts": "workspace:*",
-    "@actiontape/mcp": "workspace:*"
+    "@actiontape/authzen": "workspace:^",
+    "@actiontape/core": "workspace:^",
+    "@actiontape/recorder": "workspace:^",
+    "@actiontape/contracts": "workspace:^",
+    "@actiontape/mcp": "workspace:^"
   }
 }

@@ -40,7 +40,7 @@ import {
 } from "@actiontape/mcp";
 import type { JsonObject } from "@actiontape/core";
 
-export const CLI_VERSION = "0.0.0";
+export const CLI_VERSION = "0.1.0";
 
 const HELP = `actiontape - deterministic record/replay for agent tool calls
 
@@ -68,7 +68,8 @@ Notes:
     ActionTape diagnostics are written to stderr.
   - Tapes record traffic verbatim and may contain sensitive data.
 
-Experimental: stdio recording only. No replay, redaction, or policy yet.
+Experimental v0.1. Recording is stdio-only. Replay, redaction, and runtime
+enforcement are not implemented.
 `;
 
 const RECORD_USAGE = `usage: actiontape record --out <path> -- <command> [args...]`;
