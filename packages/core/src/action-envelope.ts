@@ -62,16 +62,39 @@ export function createActionEnvelope(init: ActionEnvelopeInit): ActionEnvelope {
 }
 
 export function isJsonValue(value: unknown): value is JsonValue {
+  return isJsonValueInner(value, new Set());
+}
+
+function isJsonValueInner(value: unknown, path: Set<object>): boolean {
   if (value === null) return true;
   switch (typeof value) {
     case "string":
-    case "number":
     case "boolean":
       return true;
-    case "object":
-      return Array.isArray(value)
-        ? value.every(isJsonValue)
-        : Object.values(value).every(isJsonValue);
+    case "number":
+      return Number.isFinite(value);
+    case "object": {
+      if (path.has(value)) return false;
+      if (Array.isArray(value)) {
+        path.add(value);
+        try {
+          for (let i = 0; i < value.length; i++) {
+            if (!(i in value) || !isJsonValueInner(value[i], path)) return false;
+          }
+          return true;
+        } finally {
+          path.delete(value);
+        }
+      }
+      const proto: unknown = Object.getPrototypeOf(value);
+      if (proto !== null && proto !== Object.prototype) return false;
+      path.add(value);
+      try {
+        return Object.values(value).every((v) => isJsonValueInner(v, path));
+      } finally {
+        path.delete(value);
+      }
+    }
     default:
       return false;
   }
