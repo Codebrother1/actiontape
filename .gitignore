@@ -3,4 +3,5 @@ dist/
 coverage/
 *.tsbuildinfo
 *.log
+*.agentlog
 .DS_Store

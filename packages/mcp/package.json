@@ -1,5 +1,5 @@
 {
-  "name": "@actiontape/cli",
+  "name": "@actiontape/mcp",
   "version": "0.0.0",
   "private": true,
   "type": "module",
@@ -11,9 +11,6 @@
       "default": "./dist/index.js"
     }
   },
-  "bin": {
-    "actiontape": "dist/cli.js"
-  },
   "files": [
     "dist"
   ],
@@ -23,9 +20,6 @@
     "test": "vitest run"
   },
   "dependencies": {
-    "@actiontape/core": "workspace:*",
-    "@actiontape/recorder": "workspace:*",
-    "@actiontape/contracts": "workspace:*",
-    "@actiontape/mcp": "workspace:*"
+    "@actiontape/core": "workspace:*"
   }
 }

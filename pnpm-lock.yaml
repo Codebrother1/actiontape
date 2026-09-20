@@ -41,6 +41,9 @@ importers:
       '@actiontape/core':
         specifier: workspace:*
         version: link:../core
+      '@actiontape/mcp':
+        specifier: workspace:*
+        version: link:../mcp
       '@actiontape/recorder':
         specifier: workspace:*
         version: link:../recorder
@@ -52,6 +55,12 @@ importers:
         version: link:../core
 
   packages/core: {}
+
+  packages/mcp:
+    dependencies:
+      '@actiontape/core':
+        specifier: workspace:*
+        version: link:../core
 
   packages/recorder:
     dependencies:

@@ -6,5 +6,11 @@ export default tseslint.config(
   { ignores: ["**/dist/**", "**/coverage/**"] },
   js.configs.recommended,
   ...tseslint.configs.recommended,
+  {
+    files: ["**/test/fixtures/**/*.mjs"],
+    languageOptions: {
+      globals: { process: "readonly", Buffer: "readonly", console: "readonly" },
+    },
+  },
   prettier,
 );
