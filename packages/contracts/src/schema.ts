@@ -1,5 +1,5 @@
-import { parse as parseYaml } from "yaml";
-import { isJsonObject, type ActionDirection, type JsonObject } from "@actiontape/core";
+import { parseDocument } from "yaml";
+import { isJsonObject, isJsonValue, type ActionDirection, type JsonObject } from "@actiontape/core";
 import { ContractParseError } from "./errors.js";
 import { isValidPointer } from "./match.js";
 import {
@@ -110,27 +110,77 @@ function validateRule(raw: JsonObject, index: number, issues: string[]): Contrac
   };
 }
 
+// Locate the first non-JSON value for a deterministic error message.
+// Aliases are disabled at toJS time, so parser output is always a finite tree.
+function nonJsonPath(value: unknown, path = "$", seen = new Set<object>()): string {
+  if (Array.isArray(value)) {
+    for (let i = 0; i < value.length; i++) {
+      const child = value[i];
+      if (!isJsonValue(child)) return nonJsonPath(child, `${path}[${i}]`, seen);
+    }
+    return path;
+  }
+  if (typeof value === "object" && value !== null) {
+    const proto: unknown = Object.getPrototypeOf(value);
+    if (proto !== null && proto !== Object.prototype) return path;
+    if (seen.has(value)) return path;
+    seen.add(value);
+    for (const [key, child] of Object.entries(value)) {
+      if (!isJsonValue(child)) return nonJsonPath(child, `${path}.${key}`, seen);
+    }
+    return path;
+  }
+  return path;
+}
+
 export function parseContract(text: string): ActionContract {
-  let doc: unknown;
+  // YAML 1.2 core schema only; warnings (e.g. unresolved custom tags) are
+  // fatal. Anchors/aliases are disabled at toJS time — contracts are data,
+  // not object graphs, so merge keys and recursive structures are rejected.
+  let doc;
   try {
-    doc = parseYaml(text, { strict: true, uniqueKeys: true });
+    doc = parseDocument(text, {
+      version: "1.2",
+      schema: "core",
+      strict: true,
+      uniqueKeys: true,
+      logLevel: "error",
+    });
   } catch (err) {
     throw new ContractParseError(
       `YAML parse failed: ${err instanceof Error ? err.message : String(err)}`,
     );
   }
+  const problems = [...doc.errors, ...doc.warnings].map(
+    (e) => e.message.split("\n")[0] ?? String(e),
+  );
+  if (problems.length > 0) throw new ContractParseError(problems);
+
+  let data: unknown;
+  try {
+    data = doc.toJS({ maxAliasCount: 0 });
+  } catch (err) {
+    throw new ContractParseError(
+      `YAML document error: ${err instanceof Error ? err.message : String(err)}`,
+    );
+  }
+  if (!isJsonValue(data)) {
+    throw new ContractParseError(
+      `contract must contain only JSON-compatible data (non-JSON value at ${nonJsonPath(data)})`,
+    );
+  }
 
   const issues: string[] = [];
-  if (!isJsonObject(doc)) {
+  if (!isJsonObject(data)) {
     throw new ContractParseError("contract document must be a YAML/JSON object");
   }
-  for (const key of Object.keys(doc)) {
+  for (const key of Object.keys(data)) {
     if (!TOP_LEVEL_FIELDS.has(key)) issues.push(`unknown top-level field "${key}"`);
   }
-  if (doc.contractVersion !== CONTRACT_VERSION) {
-    issues.push(`unsupported contractVersion ${JSON.stringify(doc.contractVersion)}`);
+  if (data.contractVersion !== CONTRACT_VERSION) {
+    issues.push(`unsupported contractVersion ${JSON.stringify(data.contractVersion)}`);
   }
-  const rules = doc.rules;
+  const rules = data.rules;
   if (!Array.isArray(rules)) {
     issues.push("rules is required and must be an array");
   } else {

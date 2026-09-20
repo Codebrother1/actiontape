@@ -147,6 +147,79 @@ rules:
       match: { target: "$(touch /tmp/actiontape-pwned)" },
     });
   });
+
+  it("rejects non-finite YAML numbers", () => {
+    const mk = (v: string) =>
+      `contractVersion: "1.0"\nrules: [{ id: a, type: require_argument, path: "/x", operator: equals, value: ${v} }]`;
+    for (const v of [".nan", ".inf", "-.Inf"]) {
+      expect(() => parseContract(mk(v))).toThrow(ContractParseError);
+      expect(() => parseContract(mk(v))).toThrow(/JSON-compatible/);
+    }
+    // Ordinary finite floats remain valid data.
+    const ok = parseContract(mk("1.5"));
+    expect(ok.rules[0]).toMatchObject({ value: 1.5 });
+  });
+
+  it("rejects explicit known YAML tags instead of materializing runtime types", () => {
+    // !!timestamp must not become a JavaScript Date inside the contract.
+    expect(() =>
+      parseContract(
+        `contractVersion: "1.0"\nrules: [{ id: a, type: require_argument, path: "/x", operator: equals, value: !!timestamp 2026-09-20T12:00:00Z }]`,
+      ),
+    ).toThrow(/JSON-compatible/);
+  });
+
+  it("rejects aliases, anchors, merge keys, and recursive structures", () => {
+    // Aliases are disabled entirely: contracts are finite JSON trees, not
+    // object graphs. Each of these must fail fast — never hang or expand.
+    const fixtures = [
+      `contractVersion: "1.0"\nrules: &r [{ id: a, type: deny }]\nextra: *r`,
+      `contractVersion: "1.0"\nrules: [{ id: a, type: require_argument, path: "/x", operator: equals, value: { a: &x [1], b: *x } }]`,
+      `contractVersion: "1.0"\nrules: [{ id: a, type: require_argument, path: "/x", operator: equals, value: &x [*x] }]`,
+      `contractVersion: "1.0"\nbase: &b { v: 1 }\nrules: [{ id: a, type: deny, match: { <<: *b } }]`,
+    ];
+    for (const text of fixtures) {
+      expect(() => parseContract(text)).toThrow(ContractParseError);
+    }
+  });
+
+  it("accepts complex nested JSON-compatible equals values", () => {
+    const contract = parseContract(`
+contractVersion: "1.0"
+rules:
+  - id: repo-shape
+    type: require_argument
+    path: /meta
+    operator: equals
+    value:
+      repository: demo
+      labels:
+        - bug
+        - urgent
+      options:
+        retries: 3
+        enabled: true
+        note: null
+`);
+    const rule = contract.rules[0]!;
+    expect(rule.type).toBe("require_argument");
+    if (rule.type !== "require_argument") return;
+    expect(rule.value).toEqual({
+      repository: "demo",
+      labels: ["bug", "urgent"],
+      options: { retries: 3, enabled: true, note: null },
+    });
+    const a = action({
+      arguments: {
+        meta: {
+          options: { enabled: true, note: null, retries: 3 },
+          labels: ["bug", "urgent"],
+          repository: "demo",
+        },
+      },
+    });
+    expect(evaluateContract(contract, [a]).ok).toBe(true);
+  });
 });
 
 describe("target glob matching", () => {

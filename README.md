@@ -128,7 +128,9 @@ Three rule types are supported: `deny` (one violation per matching action),
 and `require_argument` (a JSON Pointer `path` into `arguments` that must
 `exists` or `equals` a structural `value`). `match` filters on `protocol`,
 `direction`, `operation`, and `target` — `target` supports `*` as the only
-wildcard; an omitted `match` applies the rule to every action.
+wildcard; an omitted `match` applies the rule to every action. Contract files
+are restricted to JSON-compatible data (non-finite YAML numbers, custom tags,
+and anchors/aliases are rejected).
 
 Exit codes: `0` contract passed, `1` violations found, `2` ActionTape could not
 safely evaluate (malformed contract or tape, unreadable file, or any

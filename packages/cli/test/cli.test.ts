@@ -401,6 +401,30 @@ rules:
     expect(existsSync(marker)).toBe(false);
   });
 
+  it("exits 2 with a clean single JSON object for non-JSON contract values", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "actiontape-check-"));
+    const tape = await writeTape(dir, [PR_CALL, PR_RESULT]);
+    const contract = await writeContract(
+      dir,
+      `contractVersion: "1.0"\nrules:\n  - id: r\n    type: require_argument\n    path: /base\n    operator: equals\n    value: .nan\n`,
+    );
+    const out = sink();
+    const { io, errors } = captureIo();
+    const code = await main(["check", "--json", tape, "--contract", contract], {
+      ...io,
+      out: out.stream,
+    });
+    expect(code).toBe(2);
+    const text = out.text();
+    expect(text.trim().split("\n")).toHaveLength(1);
+    const parsed = JSON.parse(text) as Record<string, unknown>;
+    expect(parsed.status).toBe("error");
+    expect(typeof parsed.error).toBe("string");
+    // No stack trace through normal CLI output.
+    expect(errors.join("\n")).not.toMatch(/\n\s+at /);
+    expect(errors.join("\n")).toContain("JSON-compatible");
+  });
+
   it("rejects check without --contract and with unknown options", async () => {
     const { io, errors } = captureIo();
     expect(await main(["check", "some.agentlog"], io)).toBe(2);
