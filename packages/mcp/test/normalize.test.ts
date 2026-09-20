@@ -7,6 +7,8 @@ import {
 } from "@actiontape/core";
 import {
   createWireRecord,
+  getMcpToolCallRequestParams,
+  McpRequestParamsError,
   normalizeMcpTape,
   type McpWireDirection,
   type TapeEntry,
@@ -305,15 +307,7 @@ describe("normalizeMcpTape", () => {
       callRequest(0, "call-1", params),
       resultResponse(1, "call-1", COMPLETE_RESULT),
     ]);
-    expect(mcpMeta(actions[0]!).requestParams).toEqual({
-      _meta: {
-        "io.modelcontextprotocol/protocolVersion": "2026-07-28",
-        "io.modelcontextprotocol/clientInfo": { name: "actiontape-test", version: "0.0.0" },
-        "io.modelcontextprotocol/clientCapabilities": {},
-      },
-      requestState: { attempt: 1 },
-      inputResponses: [],
-    });
+    expect(mcpMeta(actions[0]!).requestParams).toEqual(params);
   });
 
   it("normalizes a legacy tools/call without modern _meta", () => {
@@ -488,5 +482,31 @@ describe("MCP 2026-07-28 multi-round-trip calls", () => {
       requestState,
       inputResponses: [{ name: "confirm_deployment", value: "yes" }],
     });
+  });
+
+  it("returns verbatim request params via getMcpToolCallRequestParams", () => {
+    const params: JsonObject = {
+      name: "interactive_tool",
+      arguments: { answer: "yes" },
+      requestState: "opaque-state-123",
+      inputResponses: { approval: "confirmed" },
+      _meta: { k: "v" },
+    };
+    const { actions } = normalizeMcpTape([
+      callRequest(0, "call-1", params),
+      resultResponse(1, "call-1", COMPLETE_RESULT),
+    ]);
+    expect(getMcpToolCallRequestParams(actions[0]!)).toEqual(params);
+  });
+
+  it("rejects getMcpToolCallRequestParams for actions without recorded params", () => {
+    const { actions } = normalizeMcpTape([
+      callRequest(0, "call-1"),
+      resultResponse(1, "call-1", COMPLETE_RESULT),
+    ]);
+    const broken = { ...actions[0]!, metadata: {} };
+    expect(() => getMcpToolCallRequestParams(broken)).toThrow(McpRequestParamsError);
+    const nonMcp = { ...actions[0]!, protocol: "other" };
+    expect(() => getMcpToolCallRequestParams(nonMcp)).toThrow(McpRequestParamsError);
   });
 });

@@ -1,4 +1,4 @@
-import { readFile } from "node:fs/promises";
+import { readFile, stat } from "node:fs/promises";
 import { constants as osConstants } from "node:os";
 import type { Readable, Writable } from "node:stream";
 import {
@@ -15,22 +15,28 @@ import {
 import {
   evaluateAccess,
   mapMcpToolCallToAuthzen,
+  renderCoazMapping,
   simulateAuthzen,
   type AuthzenAccessEvaluationRequest,
+  type AuthzenAccessEvaluationsRequest,
   type AuthzenIdentity,
   type AuthzenSimulationDecision,
+  type CoazRenderWarning,
 } from "@actiontape/authzen";
 import {
   extractMcpToolCatalogs,
+  getMcpToolCallRequestParams,
   JsonlTapeWriter,
   normalizeMcpTape,
   readTapeFile,
   resolveToolMappingProvenance,
   runStdioProxy,
   type McpMappingUnknownReason,
+  type McpToolMappingProvenance,
   type NormalizationDiagnostic,
   type TapeEntry,
 } from "@actiontape/mcp";
+import type { JsonObject } from "@actiontape/core";
 
 export const CLI_VERSION = "0.0.0";
 
@@ -46,6 +52,10 @@ Usage:
       Emit AuthZEN Access Evaluation requests (JSONL) for recorded tools/call actions
   actiontape authzen simulate [--json] <tape> --endpoint <url> --subject-id <id> [--agent-id <id>] [--timeout-ms <ms>]
       Simulate recorded actions against an AuthZEN-compatible PDP
+  actiontape authzen plan [--json] <tape>
+      Report declared/default/unknown mapping provenance per recorded tools/call
+  actiontape authzen render [--json] <tape> --token-claims <claims.json>
+      Construct the AuthZEN request(s) each recorded tools/call would produce
   actiontape --help                                     Show this help
   actiontape --version                                  Print version
 
@@ -66,11 +76,15 @@ const AUTHZEN_USAGE = `usage:
   actiontape authzen export <tape> --subject-id <id> [--agent-id <id>]
   actiontape authzen simulate [--json] <tape> --endpoint <url> --subject-id <id> [--agent-id <id>] [--timeout-ms <ms>]
   actiontape authzen plan [--json] <tape>
+  actiontape authzen render [--json] <tape> --token-claims <claims.json>
 
 export/simulate use the COAZ-MCP Draft 1 default tools/call mapping.
 plan inspects recorded tools/list evidence for declared x-authzen-mapping provenance.
+render combines that evidence with supplied simulation token claims to build
+the AuthZEN request(s) each call would produce. It never contacts a PDP and
+never falls back to the default mapping when provenance is unknown.
 
-exit codes: 0 = all permitted / provenance complete, 1 = denied / unknown provenance, 2 = operational error`;
+exit codes: 0 = all permitted / all rendered, 1 = denied / unknown provenance / mapping error, 2 = operational error`;
 
 const RESPONSE_KIND_LABELS: Record<string, string> = {
   success: "success",
@@ -811,6 +825,289 @@ async function runAuthzenPlan(
   return exitCode;
 }
 
+const TOKEN_CLAIMS_MAX_BYTES = 2 * 1024 * 1024;
+
+interface RenderActionResult {
+  actionId: string;
+  target: string;
+  status: "rendered_declared" | "rendered_default" | "unknown" | "mapping_error";
+  mappingSource: "declared" | "default_confirmed" | "unknown";
+  catalogSequence: number | null;
+  reason: string | null;
+  envelope: "evaluation" | "evaluations" | null;
+  decisionCount: number;
+  request: AuthzenAccessEvaluationRequest | AuthzenAccessEvaluationsRequest | null;
+  warnings: CoazRenderWarning[];
+}
+
+interface RenderResult {
+  schemaVersion: "1.0";
+  status: "complete" | "incomplete" | "error";
+  actionCount: number;
+  renderedDeclaredCount: number;
+  renderedDefaultCount: number;
+  unknownCount: number;
+  mappingErrorCount: number;
+  requestCount: number;
+  actions: RenderActionResult[];
+  diagnostics: { code: string; message: string; line?: number; sequence?: number }[];
+  error: string | null;
+}
+
+// Renders one historical tools/call against the simulation token. UNKNOWN
+// provenance never falls back to the default mapping; a known-provenance
+// mapping that fails for this specific call is a per-action MAPPING_ERROR,
+// not a fatal command error.
+function renderActionResult(
+  action: ActionEnvelope,
+  provenance: McpToolMappingProvenance,
+  token: JsonObject,
+): RenderActionResult {
+  const base = {
+    actionId: action.id,
+    target: action.target,
+    mappingSource: provenance.mappingSource,
+    catalogSequence: provenance.catalogSequence,
+  };
+  if (provenance.mappingSource === "unknown") {
+    return {
+      ...base,
+      status: "unknown",
+      reason: provenance.reason,
+      envelope: null,
+      decisionCount: 0,
+      request: null,
+      warnings: [],
+    };
+  }
+  const mappingError = (err: unknown): RenderActionResult => ({
+    ...base,
+    status: "mapping_error",
+    reason: err instanceof Error ? err.message : String(err),
+    envelope: null,
+    decisionCount: 0,
+    request: null,
+    warnings: [],
+  });
+  if (provenance.mappingSource === "declared") {
+    try {
+      if (provenance.declaredMapping === null) {
+        throw new Error("declared provenance is missing its mapping evidence");
+      }
+      const params = getMcpToolCallRequestParams(action);
+      const rendered = renderCoazMapping(provenance.declaredMapping, { params, token });
+      return {
+        ...base,
+        status: "rendered_declared",
+        reason: null,
+        envelope: rendered.kind,
+        decisionCount: rendered.kind === "evaluation" ? 1 : rendered.request.evaluations.length,
+        request: rendered.request,
+        warnings: rendered.warnings,
+      };
+    } catch (err) {
+      return mappingError(err);
+    }
+  }
+  try {
+    const sub = token.sub;
+    if (typeof sub !== "string" || sub.length === 0) {
+      throw new Error("token.sub must be a non-empty string");
+    }
+    const request: AuthzenAccessEvaluationRequest = {
+      subject: { type: "identity", id: sub },
+      action: { name: "tools/call" },
+      resource: { type: "tool", id: action.target },
+    };
+    const clientId = token.client_id;
+    if (clientId !== undefined) {
+      if (typeof clientId !== "string") {
+        throw new Error("token.client_id must be a string when present");
+      }
+      request.context = { agent: clientId };
+    }
+    return {
+      ...base,
+      status: "rendered_default",
+      reason: null,
+      envelope: "evaluation",
+      decisionCount: 1,
+      request,
+      warnings: [],
+    };
+  } catch (err) {
+    return mappingError(err);
+  }
+}
+
+async function runAuthzenRender(
+  argv: string[],
+  io: CliIo,
+  log: (line: string) => void,
+  error: (line: string) => void,
+): Promise<number> {
+  let json = false;
+  let path: string | undefined;
+  let tokenPath: string | undefined;
+  for (let i = 0; i < argv.length; i += 1) {
+    const arg = argv[i]!;
+    if (arg === "--json") {
+      json = true;
+    } else if (arg === "--help" || arg === "-h") {
+      log(AUTHZEN_USAGE);
+      return 0;
+    } else if (arg === "--token-claims") {
+      const value = argv[++i];
+      if (value === undefined) {
+        error("actiontape authzen render: --token-claims requires a path");
+        error(AUTHZEN_USAGE);
+        return 2;
+      }
+      tokenPath = value;
+    } else if (arg.startsWith("--token-claims=")) {
+      tokenPath = arg.slice("--token-claims=".length);
+    } else if (arg.startsWith("-")) {
+      error(`actiontape authzen render: unknown option ${arg}`);
+      error(AUTHZEN_USAGE);
+      return 2;
+    } else if (path === undefined) {
+      path = arg;
+    } else {
+      error(`actiontape authzen render: unexpected argument ${arg}`);
+      error(AUTHZEN_USAGE);
+      return 2;
+    }
+  }
+  if (path === undefined) {
+    error("actiontape authzen render: missing tape path");
+    error(AUTHZEN_USAGE);
+    return 2;
+  }
+  if (tokenPath === undefined) {
+    error("actiontape authzen render: missing required --token-claims <path>");
+    error(AUTHZEN_USAGE);
+    return 2;
+  }
+
+  const result: RenderResult = {
+    schemaVersion: "1.0",
+    status: "error",
+    actionCount: 0,
+    renderedDeclaredCount: 0,
+    renderedDefaultCount: 0,
+    unknownCount: 0,
+    mappingErrorCount: 0,
+    requestCount: 0,
+    actions: [],
+    diagnostics: [],
+    error: null,
+  };
+  const finish = (exitCode: number): number => {
+    if (json) {
+      const out = io.out ?? process.stdout;
+      out.write(JSON.stringify(result) + "\n");
+    }
+    return exitCode;
+  };
+  const fail = (message: string): number => {
+    result.error = message;
+    error(`actiontape authzen render: ${message}`);
+    return finish(2);
+  };
+
+  const loaded = await loadTapeEntries(path);
+  if ("error" in loaded) return fail(loaded.error);
+  const { actions, diagnostics } = normalizeMcpTape(loaded.entries);
+  const timeline = extractMcpToolCatalogs(loaded.entries);
+  result.actionCount = actions.length;
+  result.diagnostics = [...diagnostics, ...timeline.diagnostics];
+
+  // Simulation token claims: a small JSON object supplied by the caller. Not
+  // decoded, not validated as a credential, never treated as evidence about
+  // the original run.
+  let token: JsonObject;
+  try {
+    const info = await stat(tokenPath);
+    if (info.size > TOKEN_CLAIMS_MAX_BYTES) {
+      return fail(`token claims file exceeds ${TOKEN_CLAIMS_MAX_BYTES} bytes`);
+    }
+    const text = await readFile(tokenPath, "utf8");
+    const parsed: unknown = JSON.parse(text);
+    if (!isJsonObject(parsed)) {
+      return fail("token claims file must contain a JSON object");
+    }
+    token = parsed;
+  } catch (err) {
+    if (err instanceof SyntaxError) {
+      return fail("token claims file is not valid JSON");
+    }
+    return fail(err instanceof Error ? err.message : String(err));
+  }
+
+  reportDiagnostics(timeline.diagnostics, error);
+  if (diagnostics.length > 0) {
+    reportDiagnostics(diagnostics, error);
+    return fail(`tape produced ${diagnostics.length} normalization diagnostic(s)`);
+  }
+
+  try {
+    for (const action of actions) {
+      const provenance = resolveToolMappingProvenance(action, timeline);
+      result.actions.push(renderActionResult(action, provenance, token));
+    }
+  } catch (err) {
+    return fail(err instanceof Error ? err.message : String(err));
+  }
+
+  result.renderedDeclaredCount = result.actions.filter(
+    (a) => a.status === "rendered_declared",
+  ).length;
+  result.renderedDefaultCount = result.actions.filter(
+    (a) => a.status === "rendered_default",
+  ).length;
+  result.unknownCount = result.actions.filter((a) => a.status === "unknown").length;
+  result.mappingErrorCount = result.actions.filter((a) => a.status === "mapping_error").length;
+  // One AuthZEN HTTP request per rendered envelope — decisions inside an
+  // `evaluations` envelope do not multiply request count.
+  result.requestCount = result.renderedDeclaredCount + result.renderedDefaultCount;
+  result.status =
+    result.unknownCount === 0 && result.mappingErrorCount === 0 ? "complete" : "incomplete";
+  const exitCode = result.status === "complete" ? 0 : 1;
+  if (json) return finish(exitCode);
+
+  log("AUTHZEN RENDER");
+  log(`actions: ${result.actionCount}`);
+  log(`declared: ${result.renderedDeclaredCount}`);
+  log(`default: ${result.renderedDefaultCount}`);
+  log(`unknown: ${result.unknownCount}`);
+  log(`mapping-errors: ${result.mappingErrorCount}`);
+  log(`requests: ${result.requestCount}`);
+  log("");
+  for (const a of result.actions) {
+    let label: string;
+    let detail: string;
+    if (a.status === "rendered_declared") {
+      label = "DECLARED";
+      detail =
+        a.envelope === "evaluations" ? `evaluations (${a.decisionCount} decisions)` : "evaluation";
+    } else if (a.status === "rendered_default") {
+      label = "DEFAULT ";
+      detail = "evaluation";
+    } else if (a.status === "unknown") {
+      label = "UNKNOWN ";
+      detail = UNKNOWN_REASON_LABELS[a.reason as McpMappingUnknownReason] ?? String(a.reason);
+    } else {
+      label = "ERROR   ";
+      detail = String(a.reason);
+    }
+    if (a.warnings.length > 0) {
+      detail += `; ${a.warnings.length} warning(s)`;
+    }
+    log(`${label} ${a.target} (${a.actionId}) — ${detail}`);
+  }
+  return exitCode;
+}
+
 async function runAuthzen(
   argv: string[],
   io: CliIo,
@@ -820,7 +1117,8 @@ async function runAuthzen(
   if (argv[0] === "export") return runAuthzenExport(argv.slice(1), io, log, error);
   if (argv[0] === "simulate") return runAuthzenSimulate(argv.slice(1), io, log, error);
   if (argv[0] === "plan") return runAuthzenPlan(argv.slice(1), io, log, error);
-  error(`actiontape authzen: expected "export" or "simulate"`);
+  if (argv[0] === "render") return runAuthzenRender(argv.slice(1), io, log, error);
+  error(`actiontape authzen: expected "export", "simulate", "plan", or "render"`);
   error(AUTHZEN_USAGE);
   return 2;
 }

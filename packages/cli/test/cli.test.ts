@@ -951,4 +951,559 @@ describe("actiontape authzen", () => {
       expect(lines.join("\n")).toContain("actions: 0");
     });
   });
+
+  describe("render", () => {
+    async function writeDirTape(
+      dir: string,
+      msgs: [dir: "client_to_server" | "server_to_client", raw: unknown][],
+    ): Promise<string> {
+      const tapePath = join(dir, `tape-${msgs.length}-${Date.now()}.agentlog`);
+      const lines = msgs.map(([direction, raw], i) =>
+        JSON.stringify(
+          createWireRecord({
+            recordingId: "rec-render",
+            sequence: i,
+            direction,
+            raw: JSON.stringify(raw),
+          }),
+        ),
+      );
+      await writeFile(tapePath, lines.join("\n") + "\n", "utf8");
+      return tapePath;
+    }
+    const req = (id: number, method: string, params?: unknown) =>
+      ({ jsonrpc: "2.0", id, method, ...(params !== undefined ? { params } : {}) }) as const;
+    const res = (id: number, result: unknown) => ({ jsonrpc: "2.0", id, result }) as const;
+    const call = (id: number, name: string, args: Record<string, unknown> = {}) =>
+      req(id, "tools/call", { name, arguments: args });
+    const tool = (name: string, mapping?: unknown) => ({
+      name,
+      inputSchema: {
+        type: "object",
+        ...(mapping !== undefined ? { "x-authzen-mapping": mapping } : {}),
+      },
+    });
+    const catalog = (...tools: unknown[]) => ({ tools });
+
+    async function writeClaims(dir: string, claims: unknown): Promise<string> {
+      const p = join(dir, `claims-${Date.now()}-${Math.random().toString(36).slice(2)}.json`);
+      await writeFile(p, typeof claims === "string" ? claims : JSON.stringify(claims), "utf8");
+      return p;
+    }
+    const CLAIMS = { sub: "alice@example.com", client_id: "agent-demo" };
+
+    const GET_CUSTOMER_MAPPING = {
+      evaluation: {
+        subject: { type: "identity", id: "$token.sub" },
+        action: { name: "get_customer" },
+        resource: { type: "customer", id: "$params.arguments.id" },
+        context: { agent: "$token.?client_id" },
+      },
+    };
+
+    async function runJson(tape: string, claims: string) {
+      const out = sink();
+      const { io, errors } = captureIo();
+      const code = await main(["authzen", "render", "--json", tape, "--token-claims", claims], {
+        ...io,
+        out: out.stream,
+      });
+      const text = out.text();
+      expect(text.trim().split("\n")).toHaveLength(1);
+      return {
+        code,
+        errors,
+        parsed: JSON.parse(text) as Record<string, unknown> & {
+          actions: Record<string, unknown>[];
+        },
+      };
+    }
+
+    it("renders declared and default requests, exit 0", async () => {
+      const dir = await mkdtemp(join(tmpdir(), "actiontape-render-"));
+      const tape = await writeDirTape(dir, [
+        ["client_to_server", req(1, "tools/list")],
+        [
+          "server_to_client",
+          res(1, catalog(tool("get_customer", GET_CUSTOMER_MAPPING), tool("get_weather"))),
+        ],
+        ["client_to_server", call(2, "get_customer", { id: "cust-123" })],
+        ["server_to_client", res(2, {})],
+        ["client_to_server", call(3, "get_weather", { location: "Dallas" })],
+        ["server_to_client", res(3, {})],
+      ]);
+      const claims = await writeClaims(dir, CLAIMS);
+      const { io, lines } = captureIo();
+      expect(await main(["authzen", "render", tape, "--token-claims", claims], io)).toBe(0);
+      const out = lines.join("\n");
+      expect(out).toContain("declared: 1");
+      expect(out).toContain("default: 1");
+      expect(out).toContain("requests: 2");
+      expect(out).toContain("DECLARED get_customer");
+      expect(out).toContain("DEFAULT  get_weather");
+      // human output never carries arguments, claims, mapping, or request bodies
+      expect(out).not.toContain("cust-123");
+      expect(out).not.toContain("alice@example.com");
+      expect(out).not.toContain("Dallas");
+
+      const j = await runJson(tape, claims);
+      expect(j.code).toBe(0);
+      expect(j.parsed.status).toBe("complete");
+      expect(j.parsed.requestCount).toBe(2);
+      const [cust, weather] = j.parsed.actions;
+      expect(cust!.status).toBe("rendered_declared");
+      expect(cust!.envelope).toBe("evaluation");
+      expect(cust!.decisionCount).toBe(1);
+      expect(cust!.request).toEqual({
+        subject: { type: "identity", id: "alice@example.com" },
+        action: { name: "get_customer" },
+        resource: { type: "customer", id: "cust-123" },
+        context: { agent: "agent-demo" },
+      });
+      expect(weather!.status).toBe("rendered_default");
+      expect(weather!.request).toEqual({
+        subject: { type: "identity", id: "alice@example.com" },
+        action: { name: "tools/call" },
+        resource: { type: "tool", id: "get_weather" },
+        context: { agent: "agent-demo" },
+      });
+      // never leaks raw token claims / mapping / inputSchema / arguments
+      const raw = JSON.stringify(j.parsed);
+      expect(raw).not.toContain('"roles"');
+      expect(raw).not.toContain("inputSchema");
+      expect(raw).not.toContain("x-authzen-mapping");
+      expect(raw).not.toContain("Dallas");
+    });
+
+    it("exit 1 with UNKNOWN when no catalog exists", async () => {
+      const dir = await mkdtemp(join(tmpdir(), "actiontape-render-"));
+      const tape = await writeDirTape(dir, [
+        ["client_to_server", call(1, "mystery")],
+        ["server_to_client", res(1, {})],
+      ]);
+      const claims = await writeClaims(dir, CLAIMS);
+      const j = await runJson(tape, claims);
+      expect(j.code).toBe(1);
+      expect(j.parsed.status).toBe("incomplete");
+      const [a] = j.parsed.actions;
+      expect(a!.status).toBe("unknown");
+      expect(a!.request).toBeNull();
+      expect(a!.reason).toBe("no_catalog");
+    });
+
+    it("continues past a per-action mapping error, exit 1", async () => {
+      const dir = await mkdtemp(join(tmpdir(), "actiontape-render-"));
+      const badMapping = {
+        evaluation: {
+          action: { name: "x" },
+          resource: { type: "r", id: "$params.arguments.missing" },
+        },
+      };
+      const tape = await writeDirTape(dir, [
+        ["client_to_server", req(1, "tools/list")],
+        [
+          "server_to_client",
+          res(
+            1,
+            catalog(
+              tool("get_customer", GET_CUSTOMER_MAPPING),
+              tool("broken", badMapping),
+              tool("plain"),
+            ),
+          ),
+        ],
+        ["client_to_server", call(2, "get_customer", { id: "cust-1" })],
+        ["server_to_client", res(2, {})],
+        ["client_to_server", call(3, "broken")],
+        ["server_to_client", res(3, {})],
+        ["client_to_server", call(4, "plain")],
+        ["server_to_client", res(4, {})],
+      ]);
+      const claims = await writeClaims(dir, CLAIMS);
+      const j = await runJson(tape, claims);
+      expect(j.code).toBe(1);
+      expect(j.parsed.actions.map((a) => a.status)).toEqual([
+        "rendered_declared",
+        "mapping_error",
+        "rendered_default",
+      ]);
+      expect(j.parsed.actions[1]!.reason).toContain("missing");
+    });
+
+    it("uses exact historical request params including requestState/inputResponses", async () => {
+      const dir = await mkdtemp(join(tmpdir(), "actiontape-render-"));
+      const mapping = {
+        evaluation: {
+          action: { name: "interactive_tool" },
+          resource: {
+            type: "interaction",
+            id: "$params.requestState",
+            properties: { approval: "$params.inputResponses.approval" },
+          },
+        },
+      };
+      const tape = await writeDirTape(dir, [
+        ["client_to_server", req(1, "tools/list")],
+        ["server_to_client", res(1, catalog(tool("interactive_tool", mapping)))],
+        [
+          "client_to_server",
+          req(2, "tools/call", {
+            name: "interactive_tool",
+            arguments: { answer: "yes" },
+            requestState: "opaque-state-123",
+            inputResponses: { approval: "confirmed" },
+            _meta: { note: "x" },
+          }),
+        ],
+        ["server_to_client", res(2, {})],
+      ]);
+      const claims = await writeClaims(dir, CLAIMS);
+      const j = await runJson(tape, claims);
+      expect(j.code).toBe(0);
+      const req0 = j.parsed.actions[0]!.request as Record<string, unknown>;
+      expect(req0.resource).toEqual({
+        type: "interaction",
+        id: "opaque-state-123",
+        properties: { approval: "confirmed" },
+      });
+    });
+
+    it("renders each MRTR round with its own historical params", async () => {
+      const dir = await mkdtemp(join(tmpdir(), "actiontape-render-"));
+      const mapping = {
+        evaluation: {
+          action: { name: "interactive_tool" },
+          resource: { type: "interaction", id: "$params.requestState" },
+        },
+      };
+      const tape = await writeDirTape(dir, [
+        ["client_to_server", req(1, "tools/list")],
+        ["server_to_client", res(1, catalog(tool("interactive_tool", mapping)))],
+        [
+          "client_to_server",
+          req(2, "tools/call", {
+            name: "interactive_tool",
+            arguments: {},
+            requestState: "round-1",
+          }),
+        ],
+        ["server_to_client", res(2, { resultType: "input_required" })],
+        [
+          "client_to_server",
+          req(3, "tools/call", {
+            name: "interactive_tool",
+            arguments: { answer: "yes" },
+            requestState: "round-2",
+          }),
+        ],
+        ["server_to_client", res(3, { resultType: "complete" })],
+      ]);
+      const claims = await writeClaims(dir, CLAIMS);
+      const j = await runJson(tape, claims);
+      expect(j.code).toBe(0);
+      expect(j.parsed.actions).toHaveLength(2);
+      const resources = j.parsed.actions.map(
+        (a) => (a.request as { resource: { id: string } }).resource.id,
+      );
+      expect(resources).toEqual(["round-1", "round-2"]);
+    });
+
+    it("uses the catalog version applicable at each call's time", async () => {
+      const dir = await mkdtemp(join(tmpdir(), "actiontape-render-"));
+      const mappingA = {
+        evaluation: {
+          action: { name: "t" },
+          resource: { type: "version", id: '$"v1"' },
+        },
+      };
+      const mappingB = {
+        evaluation: {
+          action: { name: "t" },
+          resource: { type: "version", id: '$"v2"' },
+        },
+      };
+      const tape = await writeDirTape(dir, [
+        ["client_to_server", req(1, "tools/list")],
+        ["server_to_client", res(1, catalog(tool("x", mappingA)))],
+        ["client_to_server", call(2, "x")],
+        ["server_to_client", res(2, {})],
+        ["client_to_server", req(3, "tools/list")],
+        ["server_to_client", res(3, catalog(tool("x", mappingB)))],
+        ["client_to_server", call(4, "x")],
+        ["server_to_client", res(4, {})],
+      ]);
+      const claims = await writeClaims(dir, CLAIMS);
+      const j = await runJson(tape, claims);
+      expect(j.code).toBe(0);
+      const ids = j.parsed.actions.map(
+        (a) => (a.request as { resource: { id: string } }).resource.id,
+      );
+      expect(ids).toEqual(["v1", "v2"]);
+    });
+
+    it("follows declared->default and default->declared catalog changes", async () => {
+      const dir = await mkdtemp(join(tmpdir(), "actiontape-render-"));
+      const tape = await writeDirTape(dir, [
+        ["client_to_server", req(1, "tools/list")],
+        ["server_to_client", res(1, catalog(tool("x", GET_CUSTOMER_MAPPING)))],
+        ["client_to_server", call(2, "x", { id: "cust-9" })],
+        ["server_to_client", res(2, {})],
+        ["client_to_server", req(3, "tools/list")],
+        ["server_to_client", res(3, catalog(tool("x")))],
+        ["client_to_server", call(4, "x", { id: "cust-9" })],
+        ["server_to_client", res(4, {})],
+      ]);
+      const claims = await writeClaims(dir, CLAIMS);
+      const j = await runJson(tape, claims);
+      expect(j.code).toBe(0);
+      expect(j.parsed.actions.map((a) => a.status)).toEqual([
+        "rendered_declared",
+        "rendered_default",
+      ]);
+
+      const tape2 = await writeDirTape(dir, [
+        ["client_to_server", req(1, "tools/list")],
+        ["server_to_client", res(1, catalog(tool("x")))],
+        ["client_to_server", call(2, "x")],
+        ["server_to_client", res(2, {})],
+        ["client_to_server", req(3, "tools/list")],
+        [
+          "server_to_client",
+          res(
+            3,
+            catalog(
+              tool("x", {
+                evaluation: {
+                  action: { name: "x" },
+                  resource: { type: "r", id: '$"fixed"' },
+                },
+              }),
+            ),
+          ),
+        ],
+        ["client_to_server", call(4, "x")],
+        ["server_to_client", res(4, {})],
+      ]);
+      const j2 = await runJson(tape2, claims);
+      expect(j2.parsed.actions.map((a) => a.status)).toEqual([
+        "rendered_default",
+        "rendered_declared",
+      ]);
+    });
+
+    it("keeps calls UNKNOWN during a stale interval, renders after refresh", async () => {
+      const dir = await mkdtemp(join(tmpdir(), "actiontape-render-"));
+      const tape = await writeDirTape(dir, [
+        ["client_to_server", req(1, "tools/list")],
+        ["server_to_client", res(1, catalog(tool("a")))],
+        ["server_to_client", req(0, "notifications/tools/list_changed")],
+        ["client_to_server", call(2, "a")],
+        ["server_to_client", res(2, {})],
+        ["client_to_server", req(3, "tools/list")],
+        ["server_to_client", res(3, catalog(tool("a")))],
+        ["client_to_server", call(4, "a")],
+        ["server_to_client", res(4, {})],
+      ]);
+      const claims = await writeClaims(dir, CLAIMS);
+      const j = await runJson(tape, claims);
+      expect(j.code).toBe(1);
+      expect(j.parsed.actions.map((a) => a.status)).toEqual(["unknown", "rendered_default"]);
+    });
+
+    it("renders an evaluations envelope with decisionCount and one request", async () => {
+      const dir = await mkdtemp(join(tmpdir(), "actiontape-render-"));
+      const copyMapping = {
+        evaluations: {
+          subject: { type: "identity", id: "$token.sub" },
+          evaluations: [
+            {
+              action: { name: "read" },
+              resource: { type: "file", id: "$params.arguments.source" },
+            },
+            {
+              action: { name: "write" },
+              resource: { type: "file", id: "$params.arguments.dest" },
+            },
+          ],
+        },
+      };
+      const tape = await writeDirTape(dir, [
+        ["client_to_server", req(1, "tools/list")],
+        ["server_to_client", res(1, catalog(tool("copy", copyMapping)))],
+        ["client_to_server", call(2, "copy", { source: "/a", dest: "/b" })],
+        ["server_to_client", res(2, {})],
+      ]);
+      const claims = await writeClaims(dir, CLAIMS);
+      const j = await runJson(tape, claims);
+      expect(j.code).toBe(0);
+      const a = j.parsed.actions[0]!;
+      expect(a.status).toBe("rendered_declared");
+      expect(a.envelope).toBe("evaluations");
+      expect(a.decisionCount).toBe(2);
+      expect(j.parsed.requestCount).toBe(1);
+      const { io, lines } = captureIo();
+      await main(["authzen", "render", tape, "--token-claims", claims], io);
+      expect(lines.join("\n")).toContain("evaluations (2 decisions)");
+    });
+
+    it("reports subject override as a warning, still exit 0", async () => {
+      const dir = await mkdtemp(join(tmpdir(), "actiontape-render-"));
+      const mapping = {
+        evaluation: {
+          subject: { type: "identity", id: '$"other@example.com"' },
+          action: { name: "t" },
+          resource: { type: "r", id: '$"r1"' },
+        },
+      };
+      const tape = await writeDirTape(dir, [
+        ["client_to_server", req(1, "tools/list")],
+        ["server_to_client", res(1, catalog(tool("t", mapping)))],
+        ["client_to_server", call(2, "t")],
+        ["server_to_client", res(2, {})],
+      ]);
+      const claims = await writeClaims(dir, CLAIMS);
+      const j = await runJson(tape, claims);
+      expect(j.code).toBe(0);
+      expect(j.parsed.status).toBe("complete");
+      expect(j.parsed.actions[0]!.warnings).toEqual([
+        expect.objectContaining({ code: "subject_id_override" }),
+      ]);
+    });
+
+    it("rejects malformed, scalar, oversized, and missing token claims", async () => {
+      const dir = await mkdtemp(join(tmpdir(), "actiontape-render-"));
+      const tape = await writeDirTape(dir, [
+        ["client_to_server", req(1, "tools/list")],
+        ["server_to_client", res(1, catalog(tool("a")))],
+        ["client_to_server", call(2, "a")],
+        ["server_to_client", res(2, {})],
+      ]);
+      const malformed = await writeClaims(dir, "{not json");
+      const scalar = await writeClaims(dir, '"just a string"');
+      const oversized = join(dir, "big.json");
+      await writeFile(oversized, `{"sub":"${"x".repeat(3 * 1024 * 1024)}"}`, "utf8");
+
+      const out = sink();
+      const { io } = captureIo();
+      const run = (claims: string) =>
+        main(["authzen", "render", "--json", tape, "--token-claims", claims], {
+          ...io,
+          out: out.stream,
+        });
+      expect(await run(malformed)).toBe(2);
+      expect(await run(scalar)).toBe(2);
+      expect(await run(oversized)).toBe(2);
+      expect(await run(join(dir, "nonexistent.json"))).toBe(2);
+
+      const { io: io2, errors } = captureIo();
+      expect(await main(["authzen", "render", tape], io2)).toBe(2);
+      expect(errors.join("\n")).toContain("--token-claims");
+    });
+
+    it("token.sub invalid produces per-action mapping errors, not a crash", async () => {
+      const dir = await mkdtemp(join(tmpdir(), "actiontape-render-"));
+      const tape = await writeDirTape(dir, [
+        ["client_to_server", req(1, "tools/list")],
+        ["server_to_client", res(1, catalog(tool("a")))],
+        ["client_to_server", call(2, "a")],
+        ["server_to_client", res(2, {})],
+      ]);
+      const claims = await writeClaims(dir, { sub: 42 });
+      const j = await runJson(tape, claims);
+      expect(j.code).toBe(1);
+      expect(j.parsed.actions[0]!.status).toBe("mapping_error");
+      expect(j.parsed.actions[0]!.reason).toContain("token.sub");
+    });
+
+    it("non-string client_id is a mapping error for default mapping only", async () => {
+      const dir = await mkdtemp(join(tmpdir(), "actiontape-render-"));
+      const tape = await writeDirTape(dir, [
+        ["client_to_server", req(1, "tools/list")],
+        ["server_to_client", res(1, catalog(tool("a"), tool("cust", GET_CUSTOMER_MAPPING)))],
+        ["client_to_server", call(2, "a")],
+        ["server_to_client", res(2, {})],
+        ["client_to_server", call(3, "cust", { id: "c" })],
+        ["server_to_client", res(3, {})],
+      ]);
+      const claims = await writeClaims(dir, { sub: "s@x", client_id: 42 });
+      const j = await runJson(tape, claims);
+      expect(j.code).toBe(1);
+      expect(j.parsed.actions[0]!.status).toBe("mapping_error");
+      expect(j.parsed.actions[0]!.reason).toContain("client_id");
+      // declared mapping still renders; $token.?client_id treats 42 as present
+      expect(j.parsed.actions[1]!.status).toBe("rendered_declared");
+    });
+
+    it("unsafe CEL integer result is a per-action mapping error", async () => {
+      const dir = await mkdtemp(join(tmpdir(), "actiontape-render-"));
+      const mapping = {
+        evaluation: {
+          action: { name: "t" },
+          resource: { type: "r", id: '$"r1"' },
+          context: { n: "$9007199254740993" },
+        },
+      };
+      const tape = await writeDirTape(dir, [
+        ["client_to_server", req(1, "tools/list")],
+        ["server_to_client", res(1, catalog(tool("t", mapping)))],
+        ["client_to_server", call(2, "t")],
+        ["server_to_client", res(2, {})],
+      ]);
+      const claims = await writeClaims(dir, CLAIMS);
+      const j = await runJson(tape, claims);
+      expect(j.code).toBe(1);
+      expect(j.parsed.actions[0]!.status).toBe("mapping_error");
+    });
+
+    it("exit 2 on normalization diagnostics with clean --json error object", async () => {
+      const dir = await mkdtemp(join(tmpdir(), "actiontape-render-"));
+      const tapePath = join(dir, "tape.agentlog");
+      await writeFile(tapePath, "garbage\n", "utf8");
+      const claims = await writeClaims(dir, CLAIMS);
+      const j = await runJson(tapePath, claims);
+      expect(j.code).toBe(2);
+      expect(j.parsed.status).toBe("error");
+      expect(j.errors.join("\n")).toContain("malformed_jsonl");
+      expect(j.errors.join("\n")).not.toMatch(/\n\s+at /);
+    });
+
+    it("keeps command-looking strings inert across args, claims, and mapping", async () => {
+      const dir = await mkdtemp(join(tmpdir(), "actiontape-render-"));
+      const marker = join(dir, "never-created");
+      const mapping = {
+        evaluation: {
+          action: { name: "t" },
+          resource: { type: "r", id: "$params.arguments.cmd" },
+          context: { lit: `$$(touch ${marker})` },
+        },
+      };
+      const tape = await writeDirTape(dir, [
+        ["client_to_server", req(1, "tools/list")],
+        ["server_to_client", res(1, catalog(tool("t", mapping)))],
+        ["client_to_server", call(2, "t", { cmd: `$(touch ${marker})` })],
+        ["server_to_client", res(2, {})],
+      ]);
+      const claims = await writeClaims(dir, { sub: "s@x", note: `$(touch ${marker})` });
+      const j = await runJson(tape, claims);
+      expect(j.code).toBe(0);
+      expect(existsSync(marker)).toBe(false);
+      // the rendered request may contain the literal projected value as data
+      const req0 = j.parsed.actions[0]!.request as { context: { lit: string } };
+      expect(req0.context.lit).toBe(`$(touch ${marker})`);
+    });
+
+    it("exit 0 with zero counts when the tape has no tool calls", async () => {
+      const dir = await mkdtemp(join(tmpdir(), "actiontape-render-"));
+      const tape = await writeDirTape(dir, [
+        ["client_to_server", req(1, "tools/list")],
+        ["server_to_client", res(1, catalog(tool("a")))],
+      ]);
+      const claims = await writeClaims(dir, CLAIMS);
+      const j = await runJson(tape, claims);
+      expect(j.code).toBe(0);
+      expect(j.parsed.status).toBe("complete");
+      expect(j.parsed.actionCount).toBe(0);
+      expect(j.parsed.requestCount).toBe(0);
+    });
+  });
 });

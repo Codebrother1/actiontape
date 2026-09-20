@@ -155,6 +155,11 @@ enforces no live traffic.
 actiontape authzen plan ./my-run.agentlog
 actiontape authzen plan --json ./my-run.agentlog
 
+# Render the AuthZEN request(s) each recorded call would produce, using
+# declared mappings where the tape proves them and supplied simulation claims
+actiontape authzen render ./my-run.agentlog --token-claims ./claims.json
+actiontape authzen render --json ./my-run.agentlog --token-claims ./claims.json
+
 # Emit one Access Evaluation request per action (JSONL on stdout)
 actiontape authzen export ./my-run.agentlog \
   --subject-id alice@example.com --agent-id my-agent
@@ -219,8 +224,32 @@ claims supplied by the caller; ActionTape never reads or validates JWTs).
 both supported, and `.?` optional selection omits absent properties while
 preserving present `null`/`false`/`0`/`""`. CEL integers outside the safe JSON
 number range are rejected rather than rounded. Rendering produces validated
-AuthZEN request JSON only — it contacts no PDP, decides nothing, and is not
-yet used by `authzen simulate`/`export`, which remain default-mapping only.
+AuthZEN request JSON only — it contacts no PDP and decides nothing.
+`authzen simulate`/`export` remain explicit default-mapping commands.
+
+### Rendering historical requests (`authzen render`)
+
+`render` combines three inputs — recorded `tools/list` evidence (which mapping,
+if any, was applicable _at the time of each call_), the exact recorded
+`tools/call` JSON-RPC `params` (including `requestState`, `inputResponses`,
+`_meta`, etc.), and simulation token claims you supply via `--token-claims` —
+to construct the AuthZEN request(s) each historical call would produce:
+
+- **DECLARED** provenance → renders the observed `x-authzen-mapping` via CEL
+- **DEFAULT_CONFIRMED** → the COAZ-MCP default `tools/call` mapping
+  (`context.agent` only when `client_id` is a string)
+- **UNKNOWN** → **no request**; ActionTape never falls back to the default
+  mapping on insufficient evidence
+
+Per-action `mapping_error`s (bad CEL, missing params field, unsafe integer,
+invalid `token.sub`/`client_id`) are reported without aborting the run. Exit
+codes: `0` all rendered, `1` any UNKNOWN/mapping-error, `2` operational
+failure (bad tape, unreadable/malformed/oversized claims file). `render` never
+contacts a PDP, never executes a tool, and never treats claims as historical
+identity — they are explicit simulation inputs. MRTR rounds render
+independently with their own recorded params. In `--json`, a declared mapping
+may intentionally project argument/claim values into the emitted `request`;
+nothing else from the tape or claims file is included.
 
 ## Packages
 

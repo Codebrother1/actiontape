@@ -155,7 +155,7 @@ export function normalizeMcpTape(entries: Iterable<TapeEntry>): NormalizationRes
     args: JsonObject,
     extras: {
       requestId: string | number;
-      paramsExtra?: JsonObject;
+      requestParams: JsonObject;
       invalidArguments?: JsonValue;
       responseKind?: McpResponseKind;
     },
@@ -164,10 +164,10 @@ export function normalizeMcpTape(entries: Iterable<TapeEntry>): NormalizationRes
       requestId: extras.requestId,
       requestSequence: record.sequence,
       responseKind: extras.responseKind ?? "incomplete",
+      // The verbatim JSON-RPC params object — declared COAZ mappings
+      // evaluate against exactly this historical evidence.
+      requestParams: extras.requestParams,
     };
-    if (extras.paramsExtra && Object.keys(extras.paramsExtra).length > 0) {
-      mcp.requestParams = extras.paramsExtra;
-    }
     if (extras.invalidArguments !== undefined) mcp.invalidArguments = extras.invalidArguments;
     const envelope = createActionEnvelope({
       id: `mcp:${record.recordingId}:${record.sequence}`,
@@ -247,11 +247,6 @@ export function normalizeMcpTape(entries: Iterable<TapeEntry>): NormalizationRes
         });
       }
 
-      const paramsExtra: JsonObject = {};
-      for (const [key, value] of Object.entries(params)) {
-        if (key !== "name" && key !== "arguments") paramsExtra[key] = value;
-      }
-
       const key = requestIdKey(msg.id);
       if (pending.has(key)) {
         const first = pending.get(key)!;
@@ -265,7 +260,7 @@ export function normalizeMcpTape(entries: Iterable<TapeEntry>): NormalizationRes
         });
         startAction(record, entry.line, params.name, args, {
           requestId: msg.id,
-          paramsExtra,
+          requestParams: params,
           invalidArguments,
         });
         continue;
@@ -274,7 +269,7 @@ export function normalizeMcpTape(entries: Iterable<TapeEntry>): NormalizationRes
         key,
         startAction(record, entry.line, params.name, args, {
           requestId: msg.id,
-          paramsExtra,
+          requestParams: params,
           invalidArguments,
         }),
       );
@@ -321,4 +316,35 @@ export function normalizeMcpTape(entries: Iterable<TapeEntry>): NormalizationRes
   }
 
   return { actions, diagnostics };
+}
+
+export class McpRequestParamsError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "McpRequestParamsError";
+  }
+}
+
+// Returns the verbatim JSON-RPC params object recorded for a normalized
+// outbound tools/call action. Declared COAZ mappings evaluate against exactly
+// this evidence — callers must not reconstruct or mutate it. Throws when the
+// preserved params are unavailable or malformed rather than synthesizing them.
+export function getMcpToolCallRequestParams(action: ActionEnvelope): JsonObject {
+  if (
+    action.protocol !== "mcp" ||
+    action.direction !== "outbound" ||
+    action.operation !== "tools/call"
+  ) {
+    throw new McpRequestParamsError(
+      `action ${action.id}: request params require an outbound mcp tools/call action`,
+    );
+  }
+  const mcp = isJsonObject(action.metadata?.mcp) ? action.metadata.mcp : undefined;
+  const params = mcp?.requestParams;
+  if (!isJsonObject(params)) {
+    throw new McpRequestParamsError(
+      `action ${action.id}: recorded tools/call request params are unavailable or malformed`,
+    );
+  }
+  return params;
 }
