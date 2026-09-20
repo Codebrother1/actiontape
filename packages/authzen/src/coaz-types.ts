@@ -7,6 +7,9 @@ import type {
 } from "./types.js";
 
 export interface AuthzenEvaluationEntry {
+  // AuthZEN permits a per-entry subject override even though the COAZ-MCP
+  // renderer prohibits declaring one.
+  subject?: AuthzenSubject;
   action?: AuthzenAction;
   resource?: AuthzenResource;
   context?: JsonObject;

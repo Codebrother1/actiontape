@@ -14,6 +14,8 @@ import {
 } from "@actiontape/contracts";
 import {
   evaluateAccess,
+  evaluateAccessMany,
+  expandAccessEvaluationsRequest,
   mapMcpToolCallToAuthzen,
   renderCoazMapping,
   simulateAuthzen,
@@ -56,6 +58,8 @@ Usage:
       Report declared/default/unknown mapping provenance per recorded tools/call
   actiontape authzen render [--json] <tape> --token-claims <claims.json>
       Construct the AuthZEN request(s) each recorded tools/call would produce
+  actiontape authzen audit [--json] <tape> --token-claims <claims.json> --evaluation-endpoint <url> [--evaluations-endpoint <url>] [--timeout-ms <ms>]
+      Render historical requests and ask a PDP what it would have decided
   actiontape --help                                     Show this help
   actiontape --version                                  Print version
 
@@ -83,6 +87,8 @@ plan inspects recorded tools/list evidence for declared x-authzen-mapping proven
 render combines that evidence with supplied simulation token claims to build
 the AuthZEN request(s) each call would produce. It never contacts a PDP and
 never falls back to the default mapping when provenance is unknown.
+audit additionally POSTs rendered requests to a user-specified PDP —
+counterfactual historical analysis only; no tools are contacted.
 
 exit codes: 0 = all permitted / all rendered, 1 = denied / unknown provenance / mapping error, 2 = operational error`;
 
@@ -827,6 +833,29 @@ async function runAuthzenPlan(
 
 const TOKEN_CLAIMS_MAX_BYTES = 2 * 1024 * 1024;
 
+// Loads simulation token claims from a JSON file: bounded size, JSON only,
+// top-level object required. Claims are caller-supplied simulation data —
+// never decoded, validated as credentials, or treated as historical identity.
+async function loadTokenClaims(path: string): Promise<{ token: JsonObject } | { error: string }> {
+  try {
+    const info = await stat(path);
+    if (info.size > TOKEN_CLAIMS_MAX_BYTES) {
+      return { error: `token claims file exceeds ${TOKEN_CLAIMS_MAX_BYTES} bytes` };
+    }
+    const text = await readFile(path, "utf8");
+    const parsed: unknown = JSON.parse(text);
+    if (!isJsonObject(parsed)) {
+      return { error: "token claims file must contain a JSON object" };
+    }
+    return { token: parsed };
+  } catch (err) {
+    if (err instanceof SyntaxError) {
+      return { error: "token claims file is not valid JSON" };
+    }
+    return { error: err instanceof Error ? err.message : String(err) };
+  }
+}
+
 interface RenderActionResult {
   actionId: string;
   target: string;
@@ -1025,24 +1054,9 @@ async function runAuthzenRender(
   // Simulation token claims: a small JSON object supplied by the caller. Not
   // decoded, not validated as a credential, never treated as evidence about
   // the original run.
-  let token: JsonObject;
-  try {
-    const info = await stat(tokenPath);
-    if (info.size > TOKEN_CLAIMS_MAX_BYTES) {
-      return fail(`token claims file exceeds ${TOKEN_CLAIMS_MAX_BYTES} bytes`);
-    }
-    const text = await readFile(tokenPath, "utf8");
-    const parsed: unknown = JSON.parse(text);
-    if (!isJsonObject(parsed)) {
-      return fail("token claims file must contain a JSON object");
-    }
-    token = parsed;
-  } catch (err) {
-    if (err instanceof SyntaxError) {
-      return fail("token claims file is not valid JSON");
-    }
-    return fail(err instanceof Error ? err.message : String(err));
-  }
+  const claims = await loadTokenClaims(tokenPath);
+  if ("error" in claims) return fail(claims.error);
+  const token = claims.token;
 
   reportDiagnostics(timeline.diagnostics, error);
   if (diagnostics.length > 0) {
@@ -1108,6 +1122,351 @@ async function runAuthzenRender(
   return exitCode;
 }
 
+interface AuditDecision {
+  decision: boolean;
+  context: JsonObject | null;
+}
+
+interface AuditActionResult {
+  actionId: string;
+  target: string;
+  mappingSource: "declared" | "default_confirmed" | "unknown";
+  envelope: "evaluation" | "evaluations" | null;
+  status: "permit" | "deny" | "unknown" | "mapping_error" | "not_evaluated";
+  reason: string | null;
+  decisionCount: number;
+  pdpRequestCount: number;
+  decisions: AuditDecision[];
+  warnings: CoazRenderWarning[];
+}
+
+interface AuditResult {
+  schemaVersion: "1.0";
+  status: "pass" | "deny" | "incomplete" | "error";
+  actionCount: number;
+  permitCount: number;
+  denyCount: number;
+  unknownCount: number;
+  mappingErrorCount: number;
+  notEvaluatedCount: number;
+  decisionCount: number;
+  pdpRequestCount: number;
+  actions: AuditActionResult[];
+  diagnostics: { code: string; message: string; line?: number; sequence?: number }[];
+  error: string | null;
+}
+
+function validatePdpEndpoint(endpoint: string, flag: string): string | null {
+  let url: URL;
+  try {
+    url = new URL(endpoint);
+  } catch {
+    return `${flag}: invalid URL ${endpoint}`;
+  }
+  if (url.protocol !== "http:" && url.protocol !== "https:") {
+    return `${flag}: unsupported scheme "${url.protocol}"`;
+  }
+  return null;
+}
+
+async function runAuthzenAudit(
+  argv: string[],
+  io: CliIo,
+  log: (line: string) => void,
+  error: (line: string) => void,
+): Promise<number> {
+  let json = false;
+  let path: string | undefined;
+  let tokenPath: string | undefined;
+  let evaluationEndpoint: string | undefined;
+  let evaluationsEndpoint: string | undefined;
+  let timeoutMs: number | undefined;
+  for (let i = 0; i < argv.length; i += 1) {
+    const arg = argv[i]!;
+    const eq = arg.indexOf("=");
+    const flag = eq === -1 ? arg : arg.slice(0, eq);
+    const inline = eq === -1 ? undefined : arg.slice(eq + 1);
+    if (flag === "--json") {
+      json = true;
+    } else if (flag === "--help" || flag === "-h") {
+      log(AUTHZEN_USAGE);
+      return 0;
+    } else if (
+      flag === "--token-claims" ||
+      flag === "--evaluation-endpoint" ||
+      flag === "--evaluations-endpoint" ||
+      flag === "--timeout-ms"
+    ) {
+      const value = inline ?? argv[++i];
+      if (value === undefined) {
+        error(`actiontape authzen audit: ${flag} requires a value`);
+        error(AUTHZEN_USAGE);
+        return 2;
+      }
+      if (flag === "--token-claims") tokenPath = value;
+      else if (flag === "--evaluation-endpoint") evaluationEndpoint = value;
+      else if (flag === "--evaluations-endpoint") evaluationsEndpoint = value;
+      else {
+        const ms = Number(value);
+        if (!Number.isInteger(ms) || ms <= 0) {
+          error("actiontape authzen audit: --timeout-ms must be a positive integer");
+          error(AUTHZEN_USAGE);
+          return 2;
+        }
+        timeoutMs = ms;
+      }
+    } else if (arg.startsWith("-")) {
+      error(`actiontape authzen audit: unknown option ${arg}`);
+      error(AUTHZEN_USAGE);
+      return 2;
+    } else if (path === undefined) {
+      path = arg;
+    } else {
+      error(`actiontape authzen audit: unexpected argument ${arg}`);
+      error(AUTHZEN_USAGE);
+      return 2;
+    }
+  }
+  if (path === undefined) {
+    error("actiontape authzen audit: missing tape path");
+    error(AUTHZEN_USAGE);
+    return 2;
+  }
+  if (tokenPath === undefined) {
+    error("actiontape authzen audit: missing required --token-claims <path>");
+    error(AUTHZEN_USAGE);
+    return 2;
+  }
+  if (evaluationEndpoint === undefined) {
+    error("actiontape authzen audit: missing required --evaluation-endpoint <url>");
+    error(AUTHZEN_USAGE);
+    return 2;
+  }
+
+  const result: AuditResult = {
+    schemaVersion: "1.0",
+    status: "error",
+    actionCount: 0,
+    permitCount: 0,
+    denyCount: 0,
+    unknownCount: 0,
+    mappingErrorCount: 0,
+    notEvaluatedCount: 0,
+    decisionCount: 0,
+    pdpRequestCount: 0,
+    actions: [],
+    diagnostics: [],
+    error: null,
+  };
+  const finish = (exitCode: number): number => {
+    if (json) {
+      const out = io.out ?? process.stdout;
+      out.write(JSON.stringify(result) + "\n");
+    }
+    return exitCode;
+  };
+  const fail = (message: string): number => {
+    result.error = message;
+    error(`actiontape authzen audit: ${message}`);
+    return finish(2);
+  };
+
+  // Endpoints are explicit caller inputs — never derived from tape, token, or
+  // mapping data — and are validated before any network activity.
+  const evalEndpointError = validatePdpEndpoint(evaluationEndpoint, "--evaluation-endpoint");
+  if (evalEndpointError !== null) return fail(evalEndpointError);
+  if (evaluationsEndpoint !== undefined) {
+    const batchEndpointError = validatePdpEndpoint(evaluationsEndpoint, "--evaluations-endpoint");
+    if (batchEndpointError !== null) return fail(batchEndpointError);
+  }
+
+  const loaded = await loadTapeEntries(path);
+  if ("error" in loaded) return fail(loaded.error);
+  const { actions, diagnostics } = normalizeMcpTape(loaded.entries);
+  const timeline = extractMcpToolCatalogs(loaded.entries);
+  result.actionCount = actions.length;
+  result.diagnostics = [...diagnostics, ...timeline.diagnostics];
+
+  const claims = await loadTokenClaims(tokenPath);
+  if ("error" in claims) return fail(claims.error);
+  const token = claims.token;
+
+  reportDiagnostics(timeline.diagnostics, error);
+  if (diagnostics.length > 0) {
+    reportDiagnostics(diagnostics, error);
+    return fail(`tape produced ${diagnostics.length} normalization diagnostic(s)`);
+  }
+
+  // Render the entire historical tape BEFORE the first PDP request.
+  const rendered: RenderActionResult[] = [];
+  try {
+    for (const action of actions) {
+      const provenance = resolveToolMappingProvenance(action, timeline);
+      rendered.push(renderActionResult(action, provenance, token));
+    }
+  } catch (err) {
+    return fail(err instanceof Error ? err.message : String(err));
+  }
+
+  const opts = timeoutMs === undefined ? {} : { timeoutMs };
+  let pdpFailed = false;
+  for (let i = 0; i < rendered.length; i += 1) {
+    const r = rendered[i]!;
+    const base = {
+      actionId: r.actionId,
+      target: r.target,
+      mappingSource: r.mappingSource,
+      envelope: r.envelope,
+      warnings: r.warnings,
+    };
+    if (r.status === "unknown") {
+      result.actions.push({
+        ...base,
+        status: "unknown",
+        reason: r.reason,
+        decisionCount: 0,
+        pdpRequestCount: 0,
+        decisions: [],
+      });
+      continue;
+    }
+    if (r.status === "mapping_error") {
+      result.actions.push({
+        ...base,
+        status: "mapping_error",
+        reason: r.reason,
+        decisionCount: 0,
+        pdpRequestCount: 0,
+        decisions: [],
+      });
+      continue;
+    }
+    if (pdpFailed || r.request === null) {
+      result.actions.push({
+        ...base,
+        status: "not_evaluated",
+        reason: r.reason,
+        decisionCount: 0,
+        pdpRequestCount: 0,
+        decisions: [],
+      });
+      continue;
+    }
+    const decisions: AuditDecision[] = [];
+    let requests = 0;
+    try {
+      if (r.envelope === "evaluations") {
+        const batch = r.request as AuthzenAccessEvaluationsRequest;
+        if (evaluationsEndpoint !== undefined) {
+          // Native Access Evaluations API: one HTTP request for all entries.
+          requests += 1;
+          for (const d of await evaluateAccessMany(evaluationsEndpoint, batch, opts)) {
+            decisions.push({ decision: d.decision, context: d.context ?? null });
+          }
+        } else {
+          // COAZ-permitted fallback: expand into individual Access Evaluation
+          // requests against the single-decision endpoint. All entries are
+          // evaluated even after a denial — this is historical evidence.
+          for (const single of expandAccessEvaluationsRequest(batch)) {
+            requests += 1;
+            const d = await evaluateAccess(evaluationEndpoint, single, opts);
+            decisions.push({ decision: d.decision, context: d.context ?? null });
+          }
+        }
+      } else {
+        requests += 1;
+        const d = await evaluateAccess(
+          evaluationEndpoint,
+          r.request as AuthzenAccessEvaluationRequest,
+          opts,
+        );
+        decisions.push({ decision: d.decision, context: d.context ?? null });
+      }
+      const permitted = decisions.every((d) => d.decision);
+      result.actions.push({
+        ...base,
+        status: permitted ? "permit" : "deny",
+        reason: null,
+        decisionCount: decisions.length,
+        pdpRequestCount: requests,
+        decisions,
+      });
+    } catch (err) {
+      // PDP/transport failures are fatal: stop issuing requests and mark the
+      // remaining renderable actions not_evaluated rather than implying a
+      // decision was reached. Requests already sent still count.
+      pdpFailed = true;
+      result.actions.push({
+        ...base,
+        status: "not_evaluated",
+        reason: null,
+        decisionCount: decisions.length,
+        pdpRequestCount: requests,
+        decisions,
+      });
+      result.error = err instanceof Error ? err.message : String(err);
+    }
+  }
+
+  result.permitCount = result.actions.filter((a) => a.status === "permit").length;
+  result.denyCount = result.actions.filter((a) => a.status === "deny").length;
+  result.unknownCount = result.actions.filter((a) => a.status === "unknown").length;
+  result.mappingErrorCount = result.actions.filter((a) => a.status === "mapping_error").length;
+  result.notEvaluatedCount = result.actions.filter((a) => a.status === "not_evaluated").length;
+  result.decisionCount = result.actions.reduce((n, a) => n + a.decisionCount, 0);
+  result.pdpRequestCount = result.actions.reduce((n, a) => n + a.pdpRequestCount, 0);
+
+  if (result.error !== null) {
+    result.status = "error";
+  } else if (result.unknownCount > 0 || result.mappingErrorCount > 0) {
+    result.status = "incomplete";
+  } else if (result.denyCount > 0) {
+    result.status = "deny";
+  } else {
+    result.status = "pass";
+  }
+  const exitCode = result.status === "pass" ? 0 : result.status === "error" ? 2 : 1;
+  if (json) return finish(exitCode);
+
+  log("AUTHZEN AUDIT");
+  log(`status: ${result.status}`);
+  log(`actions: ${result.actionCount}`);
+  log(`permit: ${result.permitCount}`);
+  log(`deny: ${result.denyCount}`);
+  log(`unknown: ${result.unknownCount}`);
+  log(`mapping-errors: ${result.mappingErrorCount}`);
+  log(`decisions: ${result.decisionCount}`);
+  log(`pdp-requests: ${result.pdpRequestCount}`);
+  log("");
+  for (const a of result.actions) {
+    let label: string;
+    let detail: string | null = null;
+    if (a.status === "permit") {
+      label = "PERMIT  ";
+      if (a.decisionCount > 1) detail = `${a.decisionCount}/${a.decisionCount} decisions permitted`;
+    } else if (a.status === "deny") {
+      label = "DENY    ";
+      detail =
+        a.decisionCount > 1
+          ? `${a.decisions.filter((d) => d.decision).length}/${a.decisionCount} decisions permitted`
+          : null;
+    } else if (a.status === "unknown") {
+      label = "UNKNOWN ";
+      detail = UNKNOWN_REASON_LABELS[a.reason as McpMappingUnknownReason] ?? String(a.reason);
+    } else if (a.status === "mapping_error") {
+      label = "ERROR   ";
+      detail = String(a.reason);
+    } else {
+      label = "SKIPPED ";
+      detail = "not evaluated";
+    }
+    const suffix = detail === null ? "" : ` — ${detail}`;
+    log(`${label} ${a.target} (${a.actionId})${suffix}`);
+  }
+  if (result.error !== null) error(`actiontape authzen audit: ${result.error}`);
+  return exitCode;
+}
+
 async function runAuthzen(
   argv: string[],
   io: CliIo,
@@ -1118,7 +1477,8 @@ async function runAuthzen(
   if (argv[0] === "simulate") return runAuthzenSimulate(argv.slice(1), io, log, error);
   if (argv[0] === "plan") return runAuthzenPlan(argv.slice(1), io, log, error);
   if (argv[0] === "render") return runAuthzenRender(argv.slice(1), io, log, error);
-  error(`actiontape authzen: expected "export", "simulate", "plan", or "render"`);
+  if (argv[0] === "audit") return runAuthzenAudit(argv.slice(1), io, log, error);
+  error(`actiontape authzen: expected "export", "simulate", "plan", "render", or "audit"`);
   error(AUTHZEN_USAGE);
   return 2;
 }

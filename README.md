@@ -251,7 +251,62 @@ independently with their own recorded params. In `--json`, a declared mapping
 may intentionally project argument/claim values into the emitted `request`;
 nothing else from the tape or claims file is included.
 
-## Packages
+### Auditing historical decisions (`authzen audit`)
+
+`audit` completes the workflow: it runs the same historical render pipeline as
+`authzen render` and then POSTs each rendered request to a user-specified
+AuthZEN PDP, answering "given the catalog and mapping actually observed at
+that point in the recording, the exact MCP params actually sent, these
+simulation claims, and this candidate PDP — what would the PDP have decided?"
+
+```sh
+# Single-decision evaluations only
+actiontape authzen audit ./my-run.agentlog \
+  --token-claims ./claims.json \
+  --evaluation-endpoint http://localhost:8080/access/v1/evaluation
+
+# Native multi-decision support via the Access Evaluations API
+actiontape authzen audit ./my-run.agentlog \
+  --token-claims ./claims.json \
+  --evaluation-endpoint http://localhost:8080/access/v1/evaluation \
+  --evaluations-endpoint http://localhost:8080/access/v1/evaluations \
+  [--timeout-ms 5000] [--json]
+```
+
+This is still **counterfactual historical analysis**: the PDP is contacted,
+but tools are never executed, MCP is never replayed, and nothing is enforced
+on live traffic. Key behaviors:
+
+- Only `rendered_declared`/`rendered_default` actions reach the PDP.
+  **UNKNOWN** provenance is never defaulted and **mapping errors** never
+  contact the PDP.
+- The entire tape is rendered before the first PDP request; PDP calls are
+  sequential and in recorded action order.
+- `evaluations` envelopes go to `--evaluations-endpoint` natively when given
+  (one request, decisions must match entries one-for-one). Without it, each
+  envelope expands into individual Access Evaluation requests against
+  `--evaluation-endpoint` using AuthZEN top-level default semantics — all
+  entries are evaluated even after a denial, and the action is PERMIT only if
+  every decision permits.
+- Endpoints are explicit flags only — never derived from tape, token, or
+  mapping data, and never inferred by rewriting one URL from the other.
+  Requests carry no cookies, credentials, or extra headers; redirects are
+  rejected.
+- `token` claims are simulation data, not decoded credentials. Declared
+  mappings may project recorded argument/claim values into the request body
+  sent to your PDP — inspect with `authzen render` first if desired. Audit
+  output reports decisions and PDP `context`, not request bodies.
+- PDP/transport failures (timeout, redirect, HTTP error, malformed or
+  count-mismatched responses) are fatal: later actions are marked
+  `not_evaluated`, status is `error`, exit `2`.
+
+Exit codes: `0` = `pass` (everything evaluated and permitted), `1` = `deny`
+(at least one denial) or `incomplete` (any UNKNOWN/mapping error), `2` =
+`error` (tape/claims/PDP failure). Per-action status is one of `permit`,
+`deny`, `unknown`, `mapping_error`, `not_evaluated`.
+
+`authzen simulate` remains the Milestone-4 explicit default-mapping simulator;
+`authzen audit` is the historical evidence-aware declared/default audit.
 
 - `@actiontape/core` — protocol-independent `ActionEnvelope` domain model and
   a small event vocabulary (`recording.started`, `action.requested`,
@@ -262,7 +317,8 @@ nothing else from the tape or claims file is included.
 - `@actiontape/contracts` — strict contract parser (YAML/JSON) and
   deterministic rule evaluator over `ActionEnvelope[]`
 - `@actiontape/authzen` — COAZ-MCP Draft 1 default `tools/call` mapping,
-  AuthZEN Access Evaluation client, and sequential simulation engine
+  declared-mapping CEL renderer, AuthZEN Access Evaluation(s) clients, and
+  sequential simulation engine
 - `@actiontape/cli` — `actiontape` CLI (`record`, `inspect`, `check`,
   `authzen`)
 

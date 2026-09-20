@@ -6,7 +6,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Readable, Writable } from "node:stream";
 import { fileURLToPath } from "node:url";
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it } from "vitest";
 import { isActionEnvelope } from "@actiontape/core";
 import { createWireRecord } from "@actiontape/mcp";
 import { CLI_VERSION, main, type CliIo } from "../src/index.js";
@@ -1504,6 +1504,429 @@ describe("actiontape authzen", () => {
       expect(j.parsed.status).toBe("complete");
       expect(j.parsed.actionCount).toBe(0);
       expect(j.parsed.requestCount).toBe(0);
+    });
+  });
+  describe("audit", () => {
+    async function writeDirTape(
+      dir: string,
+      msgs: [dir: "client_to_server" | "server_to_client", raw: unknown][],
+      name = "tape",
+    ): Promise<string> {
+      const tapePath = join(dir, `${name}-${msgs.length}-${Date.now()}.agentlog`);
+      const lines = msgs.map(([direction, raw], i) =>
+        JSON.stringify(
+          createWireRecord({
+            recordingId: "rec-audit",
+            sequence: i,
+            direction,
+            raw: JSON.stringify(raw),
+          }),
+        ),
+      );
+      await writeFile(tapePath, lines.join("\n") + "\n", "utf8");
+      return tapePath;
+    }
+    const req = (id: number, method: string, params?: unknown) =>
+      ({ jsonrpc: "2.0", id, method, ...(params !== undefined ? { params } : {}) }) as const;
+    const res = (id: number, result: unknown) => ({ jsonrpc: "2.0", id, result }) as const;
+    const call = (id: number, name: string, args: Record<string, unknown> = {}) =>
+      req(id, "tools/call", { name, arguments: args });
+    const tool = (name: string, mapping?: unknown) => ({
+      name,
+      inputSchema: {
+        type: "object",
+        ...(mapping !== undefined ? { "x-authzen-mapping": mapping } : {}),
+      },
+    });
+    const catalog = (...tools: unknown[]) => ({ tools });
+
+    async function writeClaims(dir: string, claims: unknown): Promise<string> {
+      const p = join(dir, `claims-${Date.now()}-${Math.random().toString(36).slice(2)}.json`);
+      await writeFile(p, typeof claims === "string" ? claims : JSON.stringify(claims), "utf8");
+      return p;
+    }
+    const CLAIMS = { sub: "alice@example.com", client_id: "agent-demo" };
+
+    const GET_CUSTOMER_MAPPING = {
+      evaluation: {
+        subject: { type: "identity", id: "$token.sub" },
+        action: { name: "get_customer" },
+        resource: { type: "customer", id: "$params.arguments.id" },
+        context: { agent: "$token.?client_id" },
+      },
+    };
+    const COPY_MAPPING = {
+      evaluations: {
+        subject: { type: "identity", id: "$token.sub" },
+        evaluations: [
+          { action: { name: "read" }, resource: { type: "file", id: "$params.arguments.source" } },
+          { action: { name: "write" }, resource: { type: "file", id: "$params.arguments.dest" } },
+        ],
+      },
+    };
+
+    interface CapturedRequest {
+      path?: string;
+      body: Record<string, unknown>;
+    }
+
+    const pdps: Server[] = [];
+    afterEach(async () => {
+      while (pdps.length > 0) {
+        const pdp = pdps.pop()!;
+        await new Promise<void>((r) => pdp.close(() => r()));
+      }
+    });
+
+    async function startPdp(
+      handler: (body: Record<string, unknown>, res: ServerResponse, path: string) => void,
+    ): Promise<{ url: string; evalUrl: string; batchUrl: string; captured: CapturedRequest[] }> {
+      const captured: CapturedRequest[] = [];
+      const pdp = createServer((req: IncomingMessage, res: ServerResponse) => {
+        const chunks: Buffer[] = [];
+        req.on("data", (c) => chunks.push(c));
+        req.on("end", () => {
+          const body = JSON.parse(Buffer.concat(chunks).toString("utf8")) as Record<
+            string,
+            unknown
+          >;
+          captured.push({ path: req.url, body });
+          handler(body, res, req.url ?? "");
+        });
+      });
+      pdps.push(pdp);
+      await new Promise<void>((r) => pdp.listen(0, "127.0.0.1", r));
+      const port = (pdp.address() as AddressInfo).port;
+      return {
+        url: `http://127.0.0.1:${port}`,
+        evalUrl: `http://127.0.0.1:${port}/access/v1/evaluation`,
+        batchUrl: `http://127.0.0.1:${port}/access/v1/evaluations`,
+        captured,
+      };
+    }
+
+    async function runAuditJson(tape: string, claims: string, extra: string[] = []) {
+      const out = sink();
+      const { io, errors } = captureIo();
+      const code = await main(
+        ["authzen", "audit", "--json", tape, "--token-claims", claims, ...extra],
+        { ...io, out: out.stream },
+      );
+      const text = out.text();
+      expect(text.trim().split("\n")).toHaveLength(1);
+      return {
+        code,
+        errors,
+        parsed: JSON.parse(text) as Record<string, unknown> & {
+          actions: Record<string, unknown>[];
+        },
+      };
+    }
+
+    const permitAll = (_b: Record<string, unknown>, res: ServerResponse) => {
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ decision: true }));
+    };
+
+    it("permits rendered actions against a single-decision PDP, exit 0", async () => {
+      const dir = await mkdtemp(join(tmpdir(), "actiontape-audit-"));
+      const tape = await writeDirTape(dir, [
+        ["client_to_server", req(1, "tools/list")],
+        [
+          "server_to_client",
+          res(1, catalog(tool("get_customer", GET_CUSTOMER_MAPPING), tool("get_weather"))),
+        ],
+        ["client_to_server", call(2, "get_customer", { id: "cust-1" })],
+        ["server_to_client", res(2, {})],
+        ["client_to_server", call(3, "get_weather")],
+        ["server_to_client", res(3, {})],
+      ]);
+      const claims = await writeClaims(dir, CLAIMS);
+      const pdp = await startPdp(permitAll);
+      const j = await runAuditJson(tape, claims, ["--evaluation-endpoint", pdp.evalUrl]);
+      expect(j.code).toBe(0);
+      expect(j.parsed.status).toBe("pass");
+      expect(j.parsed.permitCount).toBe(2);
+      expect(j.parsed.decisionCount).toBe(2);
+      expect(j.parsed.pdpRequestCount).toBe(2);
+      expect(pdp.captured).toHaveLength(2);
+      expect(pdp.captured[0]!.path).toContain("/access/v1/evaluation");
+      expect(pdp.captured[0]!.body.resource).toEqual({ type: "customer", id: "cust-1" });
+      expect(pdp.captured[1]!.body.action).toEqual({ name: "tools/call" });
+      expect(JSON.stringify(j.parsed)).not.toContain("cust-1");
+    });
+
+    it("deny is exit 1 and does not stop later actions; context preserved", async () => {
+      const dir = await mkdtemp(join(tmpdir(), "actiontape-audit-"));
+      const tape = await writeDirTape(dir, [
+        ["client_to_server", req(1, "tools/list")],
+        ["server_to_client", res(1, catalog(tool("a"), tool("b"), tool("c")))],
+        ["client_to_server", call(2, "a")],
+        ["server_to_client", res(2, {})],
+        ["client_to_server", call(3, "b")],
+        ["server_to_client", res(3, {})],
+        ["client_to_server", call(4, "c")],
+        ["server_to_client", res(4, {})],
+      ]);
+      const claims = await writeClaims(dir, CLAIMS);
+      const pdp = await startPdp((body, res) => {
+        const rid = (body.resource as { id: string }).id;
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(
+          rid === "b"
+            ? JSON.stringify({ decision: false, context: { why: "no" } })
+            : JSON.stringify({ decision: true }),
+        );
+      });
+      const j = await runAuditJson(tape, claims, ["--evaluation-endpoint", pdp.evalUrl]);
+      expect(j.code).toBe(1);
+      expect(j.parsed.status).toBe("deny");
+      expect(j.parsed.actions.map((a) => a.status)).toEqual(["permit", "deny", "permit"]);
+      expect(j.parsed.actions[1]!.decisions).toEqual([{ decision: false, context: { why: "no" } }]);
+      expect(pdp.captured).toHaveLength(3);
+    });
+
+    it("native evaluations endpoint: one request, ordered decisions", async () => {
+      const dir = await mkdtemp(join(tmpdir(), "actiontape-audit-"));
+      const tape = await writeDirTape(dir, [
+        ["client_to_server", req(1, "tools/list")],
+        ["server_to_client", res(1, catalog(tool("copy", COPY_MAPPING)))],
+        ["client_to_server", call(2, "copy", { source: "/a", dest: "/b" })],
+        ["server_to_client", res(2, {})],
+      ]);
+      const claims = await writeClaims(dir, CLAIMS);
+      const pdp = await startPdp((_b, res) => {
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ evaluations: [{ decision: true }, { decision: false }] }));
+      });
+      const j = await runAuditJson(tape, claims, [
+        "--evaluation-endpoint",
+        pdp.evalUrl,
+        "--evaluations-endpoint",
+        pdp.batchUrl,
+      ]);
+      expect(j.code).toBe(1);
+      expect(j.parsed.status).toBe("deny");
+      const a = j.parsed.actions[0]!;
+      expect(a.pdpRequestCount).toBe(1);
+      expect(a.decisionCount).toBe(2);
+      expect(a.decisions).toEqual([
+        { decision: true, context: null },
+        { decision: false, context: null },
+      ]);
+      expect(pdp.captured).toHaveLength(1);
+      expect(pdp.captured[0]!.path).toContain("/access/v1/evaluations");
+    });
+
+    it("fallback expands evaluations into ordered individual requests", async () => {
+      const dir = await mkdtemp(join(tmpdir(), "actiontape-audit-"));
+      const tape = await writeDirTape(dir, [
+        ["client_to_server", req(1, "tools/list")],
+        ["server_to_client", res(1, catalog(tool("copy", COPY_MAPPING)))],
+        ["client_to_server", call(2, "copy", { source: "/a", dest: "/b" })],
+        ["server_to_client", res(2, {})],
+      ]);
+      const claims = await writeClaims(dir, CLAIMS);
+      const pdp = await startPdp((body, res) => {
+        const rid = (body.resource as { id: string }).id;
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ decision: rid === "/a" }));
+      });
+      const j = await runAuditJson(tape, claims, ["--evaluation-endpoint", pdp.evalUrl]);
+      expect(j.code).toBe(1);
+      const a = j.parsed.actions[0]!;
+      expect(a.status).toBe("deny");
+      expect(a.pdpRequestCount).toBe(2);
+      expect(a.decisionCount).toBe(2);
+      expect(pdp.captured.map((c) => c.path)).toEqual([
+        expect.stringContaining("/access/v1/evaluation"),
+        expect.stringContaining("/access/v1/evaluation"),
+      ]);
+      expect((pdp.captured[0]!.body.resource as { id: string }).id).toBe("/a");
+      expect((pdp.captured[1]!.body.resource as { id: string }).id).toBe("/b");
+      for (const c of pdp.captured) {
+        expect(c.body.subject).toEqual({ type: "identity", id: "alice@example.com" });
+        expect(c.body).not.toHaveProperty("evaluations");
+      }
+    });
+
+    it("mixed history: unknown/mapping_error skip PDP, deny retained, incomplete", async () => {
+      const dir = await mkdtemp(join(tmpdir(), "actiontape-audit-"));
+      const badMapping = {
+        evaluation: {
+          action: { name: "x" },
+          resource: { type: "r", id: "$params.arguments.nope" },
+        },
+      };
+      const tape = await writeDirTape(dir, [
+        ["client_to_server", req(1, "tools/list")],
+        [
+          "server_to_client",
+          res(
+            1,
+            catalog(
+              tool("ok1", GET_CUSTOMER_MAPPING),
+              tool("plain"),
+              tool("broken", badMapping),
+              tool("ok2", COPY_MAPPING),
+            ),
+          ),
+        ],
+        ["client_to_server", call(2, "ok1", { id: "c1" })],
+        ["server_to_client", res(2, {})],
+        ["client_to_server", call(3, "plain")],
+        ["server_to_client", res(3, {})],
+        ["client_to_server", call(4, "ghost")],
+        ["server_to_client", res(4, {})],
+        ["client_to_server", call(5, "broken")],
+        ["server_to_client", res(5, {})],
+        ["client_to_server", call(6, "ok2", { source: "/a", dest: "/b" })],
+        ["server_to_client", res(6, {})],
+      ]);
+      const claims = await writeClaims(dir, CLAIMS);
+      const pdp = await startPdp((body, res, path) => {
+        res.writeHead(200, { "Content-Type": "application/json" });
+        if (path.includes("evaluations") || Array.isArray(body.evaluations)) {
+          res.end(JSON.stringify({ evaluations: [{ decision: true }, { decision: true }] }));
+        } else {
+          const rid = (body.resource as { id: string }).id;
+          res.end(JSON.stringify({ decision: rid !== "plain" }));
+        }
+      });
+      const j = await runAuditJson(tape, claims, [
+        "--evaluation-endpoint",
+        pdp.evalUrl,
+        "--evaluations-endpoint",
+        pdp.batchUrl,
+      ]);
+      expect(j.code).toBe(1);
+      expect(j.parsed.status).toBe("incomplete");
+      expect(j.parsed.actions.map((a) => a.status)).toEqual([
+        "permit",
+        "deny",
+        "unknown",
+        "mapping_error",
+        "permit",
+      ]);
+      expect(j.parsed.denyCount).toBe(1);
+      expect(j.parsed.unknownCount).toBe(1);
+      expect(j.parsed.mappingErrorCount).toBe(1);
+      expect(j.parsed.permitCount).toBe(2);
+      expect(j.parsed.pdpRequestCount).toBe(3);
+      expect(pdp.captured).toHaveLength(3);
+    });
+
+    it("fatal PDP error stops later requests and marks them not_evaluated", async () => {
+      const dir = await mkdtemp(join(tmpdir(), "actiontape-audit-"));
+      const tape = await writeDirTape(dir, [
+        ["client_to_server", req(1, "tools/list")],
+        ["server_to_client", res(1, catalog(tool("a"), tool("b"), tool("c")))],
+        ["client_to_server", call(2, "a")],
+        ["server_to_client", res(2, {})],
+        ["client_to_server", call(3, "b")],
+        ["server_to_client", res(3, {})],
+        ["client_to_server", call(4, "c")],
+        ["server_to_client", res(4, {})],
+      ]);
+      const claims = await writeClaims(dir, CLAIMS);
+      const pdp = await startPdp((body, res) => {
+        const rid = (body.resource as { id: string }).id;
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(rid === "b" ? "not json" : JSON.stringify({ decision: true }));
+      });
+      const j = await runAuditJson(tape, claims, ["--evaluation-endpoint", pdp.evalUrl]);
+      expect(j.code).toBe(2);
+      expect(j.parsed.status).toBe("error");
+      expect(j.parsed.actions.map((a) => a.status)).toEqual([
+        "permit",
+        "not_evaluated",
+        "not_evaluated",
+      ]);
+      expect(j.parsed.pdpRequestCount).toBe(2);
+      expect(j.parsed.decisionCount).toBe(1);
+      expect(pdp.captured).toHaveLength(2);
+      expect(j.errors.join("\n")).not.toMatch(/\n\s+at /);
+    });
+
+    it("fatal tape/token failures send zero PDP requests", async () => {
+      const dir = await mkdtemp(join(tmpdir(), "actiontape-audit-"));
+      const pdp = await startPdp(permitAll);
+      const tapePath = join(dir, "bad.agentlog");
+      await writeFile(tapePath, "garbage\n", "utf8");
+      const claims = await writeClaims(dir, CLAIMS);
+      const j = await runAuditJson(tapePath, claims, ["--evaluation-endpoint", pdp.evalUrl]);
+      expect(j.code).toBe(2);
+      expect(pdp.captured).toHaveLength(0);
+
+      const tape = await writeDirTape(dir, [
+        ["client_to_server", req(1, "tools/list")],
+        ["server_to_client", res(1, catalog(tool("a")))],
+        ["client_to_server", call(2, "a")],
+        ["server_to_client", res(2, {})],
+      ]);
+      const malformed = await writeClaims(dir, "{nope");
+      const j2 = await runAuditJson(tape, malformed, ["--evaluation-endpoint", pdp.evalUrl]);
+      expect(j2.code).toBe(2);
+      expect(pdp.captured).toHaveLength(0);
+    });
+
+    it("rejects non-http endpoints and bad flags before any PDP contact", async () => {
+      const dir = await mkdtemp(join(tmpdir(), "actiontape-audit-"));
+      const tape = await writeDirTape(dir, [
+        ["client_to_server", req(1, "tools/list")],
+        ["server_to_client", res(1, catalog(tool("a")))],
+        ["client_to_server", call(2, "a")],
+        ["server_to_client", res(2, {})],
+      ]);
+      const claims = await writeClaims(dir, CLAIMS);
+      const { io, errors } = captureIo();
+      expect(
+        await main(
+          [
+            "authzen",
+            "audit",
+            tape,
+            "--token-claims",
+            claims,
+            "--evaluation-endpoint",
+            "file:///x",
+          ],
+          io,
+        ),
+      ).toBe(2);
+      expect(
+        await main(
+          [
+            "authzen",
+            "audit",
+            tape,
+            "--token-claims",
+            claims,
+            "--evaluation-endpoint",
+            "http://x",
+            "--timeout-ms",
+            "0",
+          ],
+          io,
+        ),
+      ).toBe(2);
+      expect(await main(["authzen", "audit", tape, "--token-claims", claims], io)).toBe(2);
+      expect(errors.join("\n")).toContain("--evaluation-endpoint");
+    });
+
+    it("exit 0 pass with zero tool calls and no PDP requests", async () => {
+      const dir = await mkdtemp(join(tmpdir(), "actiontape-audit-"));
+      const tape = await writeDirTape(dir, [
+        ["client_to_server", req(1, "tools/list")],
+        ["server_to_client", res(1, catalog(tool("a")))],
+      ]);
+      const claims = await writeClaims(dir, CLAIMS);
+      const pdp = await startPdp(permitAll);
+      const j = await runAuditJson(tape, claims, ["--evaluation-endpoint", pdp.evalUrl]);
+      expect(j.code).toBe(0);
+      expect(j.parsed.status).toBe("pass");
+      expect(j.parsed.pdpRequestCount).toBe(0);
+      expect(pdp.captured).toHaveLength(0);
     });
   });
 });
