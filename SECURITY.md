@@ -1,8 +1,7 @@
 # Security Policy
 
-ActionTape is experimental pre-1.0 software. The initially supported release
-line will be `0.1.x` once the first public release is made; earlier states are
-unsupported.
+ActionTape is experimental pre-1.0 software. The supported release line is
+`0.1.x` (published on npm); earlier states are unsupported.
 
 ## Reporting a vulnerability
 

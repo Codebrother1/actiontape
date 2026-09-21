@@ -47,13 +47,11 @@ dependency in its core.
 
 ## Install
 
-After the first npm release (the npm packages are not yet published):
-
 ```sh
 npm install -g actiontape
 ```
 
-Until then, build from source — see [Development](#development).
+Or build from source — see [Development](#development).
 
 ## Recording MCP stdio traffic
 
