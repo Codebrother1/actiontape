@@ -1,4 +1,8 @@
-# ActionTape
+<p align="center">
+  <img src="assets/actiontape-logo.png" alt="ActionTape logo" width="180">
+</p>
+
+<h1 align="center">ActionTape</h1>
 
 ActionTape records and analyzes AI agent tool calls. Today it is a
 deterministic **recording, contract-testing, and historical authorization**
